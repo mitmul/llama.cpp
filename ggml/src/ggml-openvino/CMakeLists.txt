@@ -10,6 +10,10 @@ ggml_add_backend_library(ggml-openvino
     ${GGML_HEADERS_OPENVINO}
 )
 
+if (GGML_BACKEND_DL)
+    target_compile_definitions(ggml-openvino PRIVATE GGML_BACKEND_BUILD GGML_BACKEND_SHARED)
+endif()
+
 target_link_libraries(ggml-openvino PRIVATE openvino::runtime TBB::tbb)
 
 if (GGML_OPENVINO)

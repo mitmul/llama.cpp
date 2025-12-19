@@ -152,10 +152,17 @@ void GgmlOvDecoder::set_input_output(ggml_tensor * node, bool naive) {
         if (!naive && !src->view_src) {
             ggml_backend_buffer * buffer = src->buffer;
 
+            const bool is_kv_cache =
+                src_name.rfind("cache_k", 0) == 0 || src_name.rfind("cache_v", 0) == 0;
             if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY || src->flags & GGML_TENSOR_FLAG_INPUT) {
-                // GGML_BACKEND_BUFFER_USAGE_ANY are kv caches
-                if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY) {
-                    assert(src_name.find("cache_k") == 0 || src_name.find("cache_v") == 0);
+                if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_ANY && !is_kv_cache) {
+                    static bool warned_any_input = false;
+                    if (!warned_any_input) {
+                        GGML_LOG_DEBUG(
+                            "%s: treating tensor %s (usage=ANY) as a model input\n",
+                            __func__, src_name.c_str());
+                        warned_any_input = true;
+                    }
                 }
                 if (m_model_inputs.find(src_name) != m_model_inputs.end()) {
                     continue;

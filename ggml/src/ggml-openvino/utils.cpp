@@ -68,6 +68,7 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
     // }
 
     auto start_time = ggml_time_us();
+    GGML_LOG_INFO("GGML OpenVINO Backend: dynamic graph compute start (device=%s)\n", device.c_str());
 
     static std::mutex cache_mutex;
     static std::unordered_map<graph_key, std::shared_ptr<GgmlOvDecoder>, graph_key_hash> decoder_cache;
@@ -101,6 +102,7 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
         }
 
         if (cache_hit) {
+            GGML_LOG_INFO("GGML OpenVINO Backend: reusing cached decoder/infer request\n");
             std::map<std::string, std::shared_ptr<ov::Node>> model_weights;
             ggml_decoder = decoder_cache[key];
             ggml_decoder->set_compute_params(c_params);
@@ -117,10 +119,12 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
             std::shared_ptr<ov::Model> model;
             auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, get_types_to_requant(device));
 
+            GGML_LOG_INFO("GGML OpenVINO Backend: creating decoder\n");
             ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static);
             decoder_end_time = ggml_time_us();
 
             auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
+            GGML_LOG_INFO("GGML OpenVINO Backend: converting graph to OpenVINO model\n");
             model = ov::frontend::ggml::FrontEnd::convert(input_model);
             ggml_decoder->clear_model_weights();
             conversion_end_time = ggml_time_us();
@@ -132,6 +136,7 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
                 ov::serialize(model, timestamped_filename);
             }
 
+            GGML_LOG_INFO("GGML OpenVINO Backend: compiling model\n");
             auto compiled_model = core.compile_model(model, device, config);
             compile_end_time = ggml_time_us();
             infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
@@ -148,6 +153,8 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
             }
             ov_input_names_cache[key] = std::move(ov_input_names);
             ov_output_names_cache[key] = std::move(ov_output_names);
+            GGML_LOG_INFO("GGML OpenVINO Backend: model compiled (inputs=%zu, outputs=%zu)\n",
+                          ov_input_names_cache[key].size(), ov_output_names_cache[key].size());
         }
     }
 
@@ -188,6 +195,8 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
         }
         GGML_LOG_INFO("  - Graph Inference Time: %ld ms \n", (infer_end_time - compile_end_time) / 1000);
     }
+
+    GGML_LOG_INFO("GGML OpenVINO Backend: inference completed\n");
 
     return GGML_STATUS_SUCCESS;
 }
