@@ -13,6 +13,16 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#else
+#    include <unistd.h>
+#endif
+
 #define GGML_OPENVINO_MAX_STREAMS 8
 
 struct ggml_backend_openvino_context {
@@ -138,8 +148,28 @@ static void ggml_backend_openvino_device_get_memory(ggml_backend_dev_t dev, size
     GGML_ASSERT(dev->context != nullptr);
     GGML_ASSERT(free != nullptr);
     GGML_ASSERT(total != nullptr);
-    *total = 1;
-    *free = 1;
+#if defined(_WIN32)
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        *total = status.ullTotalPhys;
+        *free  = status.ullAvailPhys;
+    } else {
+        *total = 0;
+        *free  = 0;
+    }
+#else
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        *total = size_t(pages) * size_t(page_size);
+        // treat all system memory as available for placement calculations
+        *free = *total;
+    } else {
+        *total = 0;
+        *free  = 0;
+    }
+#endif
 }
 
 static enum ggml_backend_dev_type ggml_backend_openvino_device_get_type(ggml_backend_dev_t dev) {
@@ -287,6 +317,7 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
     static const std::set<ggml_op> supported_ops{GGML_OP_NONE, GGML_OP_ADD, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_VIEW,
                                                  GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_PERMUTE, GGML_OP_TRANSPOSE,
                                                  GGML_OP_GET_ROWS, GGML_OP_ROPE, GGML_OP_RMS_NORM, GGML_OP_SCALE,
+                                                 GGML_OP_CONCAT,
                                                  // softmax is not updated due to replaced by flash_attn_ext
                                                  // GGML_OP_SOFT_MAX,
                                                  GGML_OP_SET_ROWS, GGML_OP_FLASH_ATTN_EXT, GGML_OP_CPY, GGML_OP_SSM_CONV,

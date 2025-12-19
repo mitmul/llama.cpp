@@ -12,7 +12,7 @@
 #include <openvino/op/convert.hpp>
 #include <openvino/op/exp.hpp>
 #include <openvino/op/gather.hpp>
-#include <openvino/op/group_convolution.hpp>
+#include <openvino/op/group_conv.hpp>
 #include <openvino/op/multiply.hpp>
 #include <openvino/op/reduce_sum.hpp>
 #include <openvino/op/reshape.hpp>
@@ -20,7 +20,7 @@
 #include <openvino/op/squeeze.hpp>
 #include <openvino/op/transpose.hpp>
 #include <openvino/op/unsqueeze.hpp>
-#include <openvino/op/v8/slice.hpp>
+#include <openvino/op/slice.hpp>
 
 namespace ov {
 namespace frontend {
@@ -60,10 +60,10 @@ OutputVector translate_ssm_conv(const NodeContext & context) {
 
     // reorder input to [n_s, d_inner, time]
     auto data_perm = make_const({3}, {2, 1, 0});
-    auto data_ncw = std::make_shared<ov::op::v0::Transpose>(sx, data_perm);
+    auto data_ncw = std::make_shared<ov::op::v1::Transpose>(sx, data_perm);
 
     // weights: [d_conv, d_inner] -> [d_inner, 1, 1, d_conv] for depthwise group convolution
-    auto weights_t = std::make_shared<ov::op::v0::Transpose>(c, make_const({2}, {1, 0}));
+    auto weights_t = std::make_shared<ov::op::v1::Transpose>(c, make_const({2}, {1, 0}));
     auto weights_shape = make_const({4}, {d_inner, 1, 1, d_conv});
     auto weights_dw = std::make_shared<ov::op::v1::Reshape>(weights_t, weights_shape, false);
 
@@ -72,7 +72,7 @@ OutputVector translate_ssm_conv(const NodeContext & context) {
 
     // back to ggml layout [d_inner, n_t, n_s]
     auto out_perm = make_const({3}, {1, 2, 0});
-    auto result = std::make_shared<ov::op::v0::Transpose>(conv, out_perm);
+    auto result = std::make_shared<ov::op::v1::Transpose>(conv, out_perm);
 
     return rename_outputs_with_suffix({result}, context.get_name());
 }
@@ -141,13 +141,13 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
 
     // Reorder layout to [n_seqs, n_head, dim, d_state]
     auto state_perm = make_const({4}, {3, 2, 1, 0});
-    auto state_cur = std::make_shared<ov::op::v0::Transpose>(gathered_state, state_perm);
+    ov::Output<ov::Node> state_cur = std::make_shared<ov::op::v1::Transpose>(gathered_state, state_perm);
 
     // Transpose inputs for easier token slicing
-    auto x_perm = std::make_shared<ov::op::v0::Transpose>(x_in, make_const({4}, {3, 1, 0, 2}));
-    auto dt_perm = std::make_shared<ov::op::v0::Transpose>(dt_in, make_const({3}, {2, 0, 1}));
-    auto B_perm = std::make_shared<ov::op::v0::Transpose>(B_in, make_const({4}, {3, 1, 0, 2}));
-    auto C_perm = std::make_shared<ov::op::v0::Transpose>(C_in, make_const({4}, {3, 1, 0, 2}));
+    auto x_perm = std::make_shared<ov::op::v1::Transpose>(x_in, make_const({4}, {3, 1, 0, 2}));
+    auto dt_perm = std::make_shared<ov::op::v1::Transpose>(dt_in, make_const({3}, {2, 0, 1}));
+    auto B_perm = std::make_shared<ov::op::v1::Transpose>(B_in, make_const({4}, {3, 1, 0, 2}));
+    auto C_perm = std::make_shared<ov::op::v1::Transpose>(C_in, make_const({4}, {3, 1, 0, 2}));
 
     // group mapping for B/C gather
     std::vector<int64_t> group_map(static_cast<size_t>(n_head));
@@ -200,7 +200,7 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
             auto dA = std::make_shared<ov::op::v0::Exp>(dtA);  // [n_seqs, n_head]
             dA_broadcast = std::make_shared<ov::op::v0::Unsqueeze>(dA, make_const({2}, {2, 3}));
         } else {
-            auto A_perm = std::make_shared<ov::op::v0::Transpose>(A_in, make_const({2}, {1, 0}));  // [n_head, d_state]
+            auto A_perm = std::make_shared<ov::op::v1::Transpose>(A_in, make_const({2}, {1, 0}));  // [n_head, d_state]
             auto A_expand = std::make_shared<ov::op::v0::Unsqueeze>(A_perm, axis0);               // [1, n_head, d_state]
             auto dt_expanded = std::make_shared<ov::op::v0::Unsqueeze>(dt_softplus, axis2);       // [n_seqs, n_head, 1]
             auto dtA = std::make_shared<ov::op::v1::Multiply>(dt_expanded, A_expand);             // [n_seqs, n_head, d_state]
@@ -227,12 +227,12 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
 
     auto y_concat = std::make_shared<ov::op::v0::Concat>(y_tokens, 2);  // [n_seqs, n_head, n_tokens, head_dim]
     auto y_perm = make_const({4}, {3, 1, 2, 0});                        // -> [head_dim, n_head, n_tokens, n_seqs]
-    auto y_out = std::make_shared<ov::op::v0::Transpose>(y_concat, y_perm);
+    auto y_out = std::make_shared<ov::op::v1::Transpose>(y_concat, y_perm);
 
     const int64_t y_elements = head_dim * n_head * n_tokens * n_seqs;
     auto y_flat = std::make_shared<ov::op::v1::Reshape>(y_out, make_const({1}, {y_elements}), false);
 
-    auto state_out = std::make_shared<ov::op::v0::Transpose>(state_cur, make_const({4}, {3, 2, 1, 0}));
+    auto state_out = std::make_shared<ov::op::v1::Transpose>(state_cur, make_const({4}, {3, 2, 1, 0}));
     const int64_t state_elements = d_state * head_dim * n_head * n_seqs;
     auto state_flat = std::make_shared<ov::op::v1::Reshape>(state_out, make_const({1}, {state_elements}), false);
 

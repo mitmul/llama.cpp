@@ -154,10 +154,30 @@ static void llama_params_fit_impl(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
+    auto collect_device_memory = [&]() {
+        devs.clear();
+        hp_ngl = 0;
+        hp_nct = 0;
+        hp_nex = 0;
+        return llama_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    };
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LLAMA_LOG_DEBUG("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = llama_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full = collect_device_memory();
+
+    // Some models carry extremely large training contexts (e.g., millions of tokens).
+    // When the user did not request a context size, cap the default to a practical value
+    // so we don't attempt to allocate a multi-hundred-GB KV cache by default.
+    if (cparams->n_ctx == 0 && hp_nct > 65536) {
+        const uint32_t capped_ctx = 8192;
+        cparams->n_ctx = std::min<uint32_t>(hp_nct, capped_ctx);
+        LLAMA_LOG_INFO("%s: training context is %" PRIu32 " tokens; capping default inference context to %" PRIu32
+                       " tokens (override with -c/--ctx to change)\n",
+            __func__, hp_nct, cparams->n_ctx);
+        dmds_full = collect_device_memory();
+    }
     const size_t nd = devs.size(); // number of devices
     if (nd == 0) {
         LLAMA_LOG_INFO("%s: no devices with dedicated memory found\n", __func__);
