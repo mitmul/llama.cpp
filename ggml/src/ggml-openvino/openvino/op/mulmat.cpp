@@ -80,6 +80,13 @@ OutputVector translate_mulmat(const NodeContext & context) {
 
     res = std::make_shared<ov::op::v0::MatMul>(A, B, false, transpose_b);
 
+    const auto output_shape = context.get_output_shape().to_shape();
+    if (!output_shape.empty()) {
+        std::vector<int64_t> target_shape(output_shape.begin(), output_shape.end());
+        auto shape_const = ov::op::v0::Constant::create(ov::element::i64, {target_shape.size()}, target_shape);
+        res = std::make_shared<ov::op::v1::Reshape>(res, shape_const, false);
+    }
+
     return rename_outputs_with_suffix({res}, context.get_name());
 }
 

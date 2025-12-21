@@ -60,6 +60,7 @@ enum ggml_status ov_graph_compute(ggml_cgraph * cgraph) {
 }
 
 enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::string & device) {
+    try {
     static auto is_static = false;
     static auto config = get_ov_compile_config(device);
 
@@ -83,101 +84,123 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
     std::tie(m_params, c_params) = GgmlOvDecoder::compute_llm_params(cgraph, is_static);
 
     const auto key = compute_graph_key(cgraph);
-    bool cache_hit;
+    bool cache_hit = false;
+    bool force_rebuild = false;
 
     int64_t decoder_end_time;
     int64_t conversion_end_time;
     int64_t compile_end_time;
     int64_t infer_end_time;
 
-    {
-        std::lock_guard<std::mutex> lock(cache_mutex);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
 
-        auto it = decoder_cache.find(key);
+            if (force_rebuild) {
+                decoder_cache.erase(key);
+                infer_request_cache.erase(key);
+                ov_input_names_cache.erase(key);
+                ov_output_names_cache.erase(key);
+            }
 
-        cache_hit = it != decoder_cache.end();
-        if (cache_hit) {
-            ggml_decoder = it->second;
-            cache_hit = ggml_decoder->get_model_params().can_reuse_dynamically(m_params);
+            auto it = decoder_cache.find(key);
+
+            cache_hit = !force_rebuild && it != decoder_cache.end();
+            if (cache_hit) {
+                ggml_decoder = it->second;
+                cache_hit = ggml_decoder->get_model_params().can_reuse_dynamically(m_params);
+            }
+
+            if (cache_hit) {
+                GGML_LOG_INFO("GGML OpenVINO Backend: reusing cached decoder/infer request\n");
+                ggml_decoder = decoder_cache[key];
+                ggml_decoder->set_compute_params(c_params);
+                ggml_decoder->set_model_params(m_params);
+                ggml_decoder->add_extra_inputs();
+                infer_request = infer_request_cache[key];
+
+                decoder_end_time = ggml_time_us();
+                conversion_end_time = decoder_end_time;
+                compile_end_time = decoder_end_time;
+            } else {
+                infer_request_cache.erase(key);
+
+                std::shared_ptr<ov::Model> model;
+                auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, get_types_to_requant(device));
+
+                GGML_LOG_INFO("GGML OpenVINO Backend: creating decoder\n");
+                ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static);
+                decoder_end_time = ggml_time_us();
+
+                auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
+                GGML_LOG_INFO("GGML OpenVINO Backend: converting graph to OpenVINO model\n");
+                model = ov::frontend::ggml::FrontEnd::convert(input_model);
+                ggml_decoder->clear_model_weights();
+                conversion_end_time = ggml_time_us();
+
+                if (getenv("GGML_OPENVINO_DUMP_IR")) {
+                    char timestamped_filename[64];
+                    auto timestamp = (long long) ggml_time_us();
+                    snprintf(timestamped_filename, sizeof(timestamped_filename), "model_%lld.xml", timestamp);
+                    ov::serialize(model, timestamped_filename);
+                }
+
+                GGML_LOG_INFO("GGML OpenVINO Backend: compiling model\n");
+                auto compiled_model = core.compile_model(model, device, config);
+                compile_end_time = ggml_time_us();
+                infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
+                infer_request_cache[key] = infer_request;
+                decoder_cache[key] = ggml_decoder;
+
+                std::vector<std::string> ov_input_names;
+                std::vector<std::string> ov_output_names;
+                for (const auto & ov_param : model->get_parameters()) {
+                    ov_input_names.push_back(ov_param->get_friendly_name());
+                }
+                for (const auto & ov_output : model->get_results()) {
+                    ov_output_names.push_back(ov_output->get_friendly_name());
+                }
+                ov_input_names_cache[key] = std::move(ov_input_names);
+                ov_output_names_cache[key] = std::move(ov_output_names);
+                GGML_LOG_INFO("GGML OpenVINO Backend: model compiled (inputs=%zu, outputs=%zu)\n",
+                              ov_input_names_cache[key].size(), ov_output_names_cache[key].size());
+            }
         }
 
-        if (cache_hit) {
-            GGML_LOG_INFO("GGML OpenVINO Backend: reusing cached decoder/infer request\n");
-            std::map<std::string, std::shared_ptr<ov::Node>> model_weights;
-            ggml_decoder = decoder_cache[key];
-            ggml_decoder->set_compute_params(c_params);
-            ggml_decoder->set_model_params(m_params);
-            ggml_decoder->add_extra_inputs();
-            infer_request = infer_request_cache[key];
+        auto ov_input_names = ov_input_names_cache[key];
+        auto ov_output_names = ov_output_names_cache[key];
 
-            decoder_end_time = ggml_time_us();
-            conversion_end_time = decoder_end_time;
-            compile_end_time = decoder_end_time;
-        } else {
-            infer_request_cache.erase(key);
+        try {
+            for (size_t i = 0; i < ov_input_names.size(); i++) {
+                auto param_name = ov_input_names[i];
+                auto input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
+                infer_request->set_input_tensor(i, input_tensor);
 
-            std::shared_ptr<ov::Model> model;
-            auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, get_types_to_requant(device));
-
-            GGML_LOG_INFO("GGML OpenVINO Backend: creating decoder\n");
-            ggml_decoder = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights, is_static);
-            decoder_end_time = ggml_time_us();
-
-            auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder);
-            GGML_LOG_INFO("GGML OpenVINO Backend: converting graph to OpenVINO model\n");
-            model = ov::frontend::ggml::FrontEnd::convert(input_model);
-            ggml_decoder->clear_model_weights();
-            conversion_end_time = ggml_time_us();
-
-            if (getenv("GGML_OPENVINO_DUMP_IR")) {
-                char timestamped_filename[64];
-                auto timestamp = (long long) ggml_time_us();
-                snprintf(timestamped_filename, sizeof(timestamped_filename), "model_%lld.xml", timestamp);
-                ov::serialize(model, timestamped_filename);
+                if (getenv("GGML_OPENVINO_DEBUG_INPUT")) {
+                    print_input_tensor_info(param_name, input_tensor);
+                }
             }
 
-            GGML_LOG_INFO("GGML OpenVINO Backend: compiling model\n");
-            auto compiled_model = core.compile_model(model, device, config);
-            compile_end_time = ggml_time_us();
-            infer_request = std::make_shared<ov::InferRequest>(compiled_model.create_infer_request());
-            infer_request_cache[key] = infer_request;
-            decoder_cache[key] = ggml_decoder;
+            for (size_t i = 0; i < ov_output_names.size(); i++) {
+                auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
+                infer_request->set_output_tensor(i, output_tensor);
+            }
 
-            std::vector<std::string> ov_input_names;
-            std::vector<std::string> ov_output_names;
-            for (const auto & ov_param : model->get_parameters()) {
-                ov_input_names.push_back(ov_param->get_friendly_name());
+            infer_request->infer();
+            infer_end_time = ggml_time_us();
+            break;
+        } catch (const std::exception & e) {
+            if (cache_hit && !force_rebuild) {
+                GGML_LOG_WARN("GGML OpenVINO Backend: cached model input mismatch, rebuilding: %s\n", e.what());
+                force_rebuild = true;
+                continue;
             }
-            for (const auto & ov_output : model->get_results()) {
-                ov_output_names.push_back(ov_output->get_friendly_name());
-            }
-            ov_input_names_cache[key] = std::move(ov_input_names);
-            ov_output_names_cache[key] = std::move(ov_output_names);
-            GGML_LOG_INFO("GGML OpenVINO Backend: model compiled (inputs=%zu, outputs=%zu)\n",
-                          ov_input_names_cache[key].size(), ov_output_names_cache[key].size());
+            throw;
         }
     }
 
     auto ov_input_names = ov_input_names_cache[key];
     auto ov_output_names = ov_output_names_cache[key];
-
-    for (size_t i = 0; i < ov_input_names.size(); i++) {
-        auto param_name = ov_input_names[i];
-        auto input_tensor = get_ov_input_tensor(ggml_decoder, param_name);
-        infer_request->set_input_tensor(i, input_tensor);
-
-        if (getenv("GGML_OPENVINO_DEBUG_INPUT")) {
-            print_input_tensor_info(param_name, input_tensor);
-        }
-    }
-
-    for (size_t i = 0; i < ov_output_names.size(); i++) {
-        auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
-        infer_request->set_output_tensor(i, output_tensor);
-    }
-
-    infer_request->infer();
-    infer_end_time = ggml_time_us();
 
     if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
         for (size_t i = 0; i < ov_output_names.size(); i++) {
@@ -199,6 +222,12 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
     GGML_LOG_INFO("GGML OpenVINO Backend: inference completed\n");
 
     return GGML_STATUS_SUCCESS;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: dynamic compute exception: %s\n", e.what());
+    } catch (...) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: dynamic compute encountered an unknown exception\n");
+    }
+    return GGML_STATUS_FAILED;
 }
 
 enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
@@ -483,12 +512,9 @@ ov::Tensor convert_ggml_input_to_ov(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
     const auto * ggml_tensor = ggml_decoder->get_input_ggml_tensor(name);
     auto * input_data = ggml_tensor->data;
     ov::Shape input_shape;
-    if (ggml_tensor->op == GGML_OP_VIEW) {
-        // This case is added to make test-backend-ops work
-        input_shape = ggml_decoder->get_shape(ggml_tensor->view_src);
-    } else {
-        input_shape =  ggml_decoder->get_shape(ggml_tensor);
-    }
+    // Respect VIEW shapes for model inputs: many graphs pass reshaped views (e.g. [64,1,33,1]) as inputs.
+    // Using view_src here causes parameter/tensor shape mismatches at inference time.
+    input_shape = ggml_decoder->get_shape(ggml_tensor);
     auto input_tensor = ov::Tensor(ggml_decoder->get_ov_type(ggml_tensor), input_shape, input_data);
     return input_tensor;
 }
@@ -497,7 +523,18 @@ ov::Tensor convert_ggml_input_to_ov(std::shared_ptr<GgmlOvDecoder> ggml_decoder,
 ov::Tensor get_ov_input_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder, const std::string & param_name) {
     ov::Tensor input_tensor;
     if (ggml_decoder->get_model_extra_inputs().find(param_name) != ggml_decoder->get_model_extra_inputs().end()) {
-        input_tensor = *ggml_decoder->get_model_extra_input_values().at(param_name);
+        const auto & extra_inputs = ggml_decoder->get_model_extra_input_values();
+        auto it = extra_inputs.find(param_name);
+        if (it == extra_inputs.end()) {
+            GGML_LOG_ERROR("GGML OpenVINO Backend: extra input '%s' requested but not found; available extra inputs: ",
+                           param_name.c_str());
+            for (const auto & kv : extra_inputs) {
+                GGML_LOG_ERROR("%s ", kv.first.c_str());
+            }
+            GGML_LOG_ERROR("\n");
+            throw std::out_of_range("missing extra input " + param_name);
+        }
+        input_tensor = *it->second;
     } else {
         input_tensor = convert_ggml_input_to_ov(ggml_decoder, param_name);
     }
@@ -619,7 +656,17 @@ ov::Tensor get_ov_input_tensor_static_prefill(std::shared_ptr<GgmlOvDecoder> ggm
 }
 
 ov::Tensor get_ov_output_tensor(std::shared_ptr<GgmlOvDecoder> ggml_decoder, const std::string & result_name) {
-    auto * ggml_tensor = ggml_decoder->get_model_outputs().at(result_name);
+    const auto & outputs = ggml_decoder->get_model_outputs();
+    auto it = outputs.find(result_name);
+    if (it == outputs.end()) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: output '%s' not found; available outputs: ", result_name.c_str());
+        for (const auto & kv : outputs) {
+            GGML_LOG_ERROR("%s ", kv.first.c_str());
+        }
+        GGML_LOG_ERROR("\n");
+        throw std::out_of_range("missing model output " + result_name);
+    }
+    auto * ggml_tensor = it->second;
     auto output_type = ggml_decoder->get_ov_type(ggml_tensor);
     auto output_shape = ggml_decoder->get_shape(ggml_tensor);
 

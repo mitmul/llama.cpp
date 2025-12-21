@@ -21,6 +21,7 @@
 #include <openvino/op/transpose.hpp>
 #include <openvino/op/unsqueeze.hpp>
 #include <openvino/op/slice.hpp>
+#include <sstream>
 
 namespace ov {
 namespace frontend {
@@ -38,24 +39,55 @@ std::shared_ptr<ov::op::v0::Constant> make_const(const ov::Shape & shape, const 
 OutputVector translate_ssm_conv(const NodeContext & context) {
     num_inputs_check(context, 2, 2);
 
-    const auto sx = context.get_input(0);
-    const auto c = context.get_input(1);
+    auto sx = context.get_input(0);
+    auto c = context.get_input(1);
 
-    const auto sx_shape_ps = context.get_input_shape(0);
-    const auto c_shape_ps = context.get_input_shape(1);
-    FRONT_END_GENERAL_CHECK(sx_shape_ps.is_static() && c_shape_ps.is_static(), "SSM_CONV requires static shapes");
+    auto sx_shape = context.get_input_shape(0);
+    auto c_shape = context.get_input_shape(1);
+    FRONT_END_GENERAL_CHECK(sx_shape.is_static() && c_shape.is_static(), "SSM_CONV requires static shapes");
 
-    const auto sx_shape = sx_shape_ps.to_shape();  // {d_conv - 1 + n_t, d_inner, n_s}
-    const auto c_shape = c_shape_ps.to_shape();    // {d_conv, d_inner}
-    FRONT_END_GENERAL_CHECK(sx_shape.size() == 3 && c_shape.size() == 2, "SSM_CONV expects 3D input and 2D kernel");
+    auto sx_shape_vec = sx_shape.to_shape();
+    auto c_shape_vec = c_shape.to_shape();
 
-    const int64_t d_conv = static_cast<int64_t>(c_shape[0]);
-    const int64_t d_inner = static_cast<int64_t>(c_shape[1]);
-    const int64_t n_t = static_cast<int64_t>(sx_shape[0]) - d_conv + 1;
-    const int64_t n_s = static_cast<int64_t>(sx_shape[2]);
+    auto to_ggml_shape = [](const std::vector<size_t> & shape) {
+        return std::vector<int64_t>(shape.rbegin(), shape.rend());
+    };
+    auto trim_trailing_ones = [](std::vector<int64_t> & shape, size_t target_rank) {
+        while (shape.size() > target_rank && !shape.empty() && shape.back() == 1) {
+            shape.pop_back();
+        }
+    };
 
-    FRONT_END_GENERAL_CHECK(sx_shape[1] == c_shape[1], "SSM_CONV channel size mismatch");
-    FRONT_END_GENERAL_CHECK(sx_shape[0] == static_cast<size_t>(d_conv - 1 + n_t),
+    auto sx_shape_ggml = to_ggml_shape(sx_shape_vec);  // ggml order: [ne0, ne1, ...]
+    auto c_shape_ggml = to_ggml_shape(c_shape_vec);
+    trim_trailing_ones(sx_shape_ggml, 3);
+    trim_trailing_ones(c_shape_ggml, 2);
+
+    FRONT_END_GENERAL_CHECK(sx_shape_ggml.size() == 3 && c_shape_ggml.size() == 2,
+                            "SSM_CONV expects 3D input and 2D kernel");
+
+    if (sx_shape_vec.size() != sx_shape_ggml.size() ||
+        !std::equal(sx_shape_vec.rbegin(), sx_shape_vec.rbegin() + static_cast<long>(sx_shape_ggml.size()),
+                    sx_shape_ggml.begin())) {
+        auto target = ov::op::v0::Constant::create(
+            ov::element::i64, {sx_shape_ggml.size()}, std::vector<int64_t>(sx_shape_ggml.begin(), sx_shape_ggml.end()));
+        sx = std::make_shared<ov::op::v1::Reshape>(sx, target, false);
+    }
+    if (c_shape_vec.size() != c_shape_ggml.size() ||
+        !std::equal(c_shape_vec.rbegin(), c_shape_vec.rbegin() + static_cast<long>(c_shape_ggml.size()),
+                    c_shape_ggml.begin())) {
+        auto target = ov::op::v0::Constant::create(
+            ov::element::i64, {c_shape_ggml.size()}, std::vector<int64_t>(c_shape_ggml.begin(), c_shape_ggml.end()));
+        c = std::make_shared<ov::op::v1::Reshape>(c, target, false);
+    }
+
+    const int64_t d_conv = static_cast<int64_t>(c_shape_ggml[0]);
+    const int64_t d_inner = static_cast<int64_t>(c_shape_ggml[1]);
+    const int64_t n_t = static_cast<int64_t>(sx_shape_ggml[0]) - d_conv + 1;
+    const int64_t n_s = static_cast<int64_t>(sx_shape_ggml[2]);
+
+    FRONT_END_GENERAL_CHECK(sx_shape_ggml[1] == c_shape_ggml[1], "SSM_CONV channel size mismatch");
+    FRONT_END_GENERAL_CHECK(sx_shape_ggml[0] == static_cast<size_t>(d_conv - 1 + n_t),
                             "SSM_CONV time dimension mismatch");
 
     // reorder input to [n_s, d_inner, time]
@@ -70,9 +102,16 @@ OutputVector translate_ssm_conv(const NodeContext & context) {
     auto conv = std::make_shared<ov::op::v1::GroupConvolution>(
         data_ncw, weights_dw, ov::Strides{1}, ov::CoordinateDiff{0}, ov::CoordinateDiff{0}, ov::Strides{1});
 
-    // back to ggml layout [d_inner, n_t, n_s]
-    auto out_perm = make_const({3}, {1, 2, 0});
-    auto result = std::make_shared<ov::op::v1::Transpose>(conv, out_perm);
+    // back to layout expected by downstream ops: [n_s, n_t, d_inner]
+    auto out_perm = make_const({3}, {0, 2, 1});
+    ov::Output<ov::Node> result = std::make_shared<ov::op::v1::Transpose>(conv, out_perm);
+
+    const auto output_shape = context.get_output_shape().to_shape();
+    if (!output_shape.empty()) {
+        std::vector<int64_t> target_shape(output_shape.begin(), output_shape.end());
+        auto shape_const = ov::op::v0::Constant::create(ov::element::i64, {target_shape.size()}, target_shape);
+        result = std::make_shared<ov::op::v1::Reshape>(result, shape_const, false);
+    }
 
     return rename_outputs_with_suffix({result}, context.get_name());
 }
@@ -99,55 +138,80 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
                                 A_shape_ps.is_static() && B_shape_ps.is_static() && C_shape_ps.is_static(),
                             "SSM_SCAN requires static input shapes");
 
-    const auto state_shape = state_shape_ps.to_shape();  // {d_state, dim, n_head, n_state_seqs}
-    const auto x_shape = x_shape_ps.to_shape();          // {dim, n_head, n_seq_tokens, n_seqs}
-    const auto dt_shape = dt_shape_ps.to_shape();        // {n_head, n_seq_tokens, n_seqs}
-    const auto A_shape = A_shape_ps.to_shape();          // {d_state or 1, n_head}
-    const auto B_shape = B_shape_ps.to_shape();          // {d_state, n_group, n_seq_tokens, n_seqs}
-    const auto C_shape = C_shape_ps.to_shape();          // same as B
+    // OpenVINO shapes are reversed from ggml: [ne3, ne2, ne1, ne0].
+    auto state_shape = state_shape_ps.to_shape();  // {n_state_seqs, n_head, head_dim, d_state}
+    auto x_shape = x_shape_ps.to_shape();          // {n_seqs, n_seq_tokens, n_head, head_dim}
+    auto dt_shape = dt_shape_ps.to_shape();        // {n_seqs, n_seq_tokens, n_head}
+    auto A_shape = A_shape_ps.to_shape();          // {n_head, d_state or 1}
+    auto B_shape = B_shape_ps.to_shape();          // {n_seqs, n_seq_tokens, n_group, d_state}
+    auto C_shape = C_shape_ps.to_shape();          // same as B
 
-    FRONT_END_GENERAL_CHECK(state_shape.size() == 4 && x_shape.size() == 4 && dt_shape.size() == 3 &&
-                                B_shape.size() == 4 && C_shape.size() == 4 && A_shape.size() == 2,
-                            "Unexpected rank for SSM_SCAN inputs");
+    auto normalize_rank = [](ov::Output<ov::Node> node, ov::Shape & shape, size_t target_rank) -> ov::Output<ov::Node> {
+        if (shape.size() == target_rank) {
+            return node;
+        }
+        ov::Shape adjusted;
+        if (shape.size() > target_rank) {
+            // keep the trailing dimensions (token/head ordering) and drop leading ones if any
+            adjusted.insert(adjusted.end(), shape.end() - static_cast<std::ptrdiff_t>(target_rank), shape.end());
+        } else {
+            // pad leading ones to preserve trailing ordering
+            adjusted.insert(adjusted.end(), target_rank - shape.size(), 1);
+            adjusted.insert(adjusted.end(), shape.begin(), shape.end());
+        }
+        shape = adjusted;
+        auto shape_const = ov::op::v0::Constant::create(
+            ov::element::i64, {shape.size()}, std::vector<int64_t>(shape.begin(), shape.end()));
+        return std::make_shared<ov::op::v1::Reshape>(node, shape_const, false);
+    };
 
-    const int64_t d_state = static_cast<int64_t>(state_shape[0]);
-    const int64_t head_dim = static_cast<int64_t>(state_shape[1]);
-    const int64_t n_head = static_cast<int64_t>(state_shape[2]);
-    const int64_t n_state_seqs = static_cast<int64_t>(state_shape[3]);
-    const int64_t n_tokens = static_cast<int64_t>(x_shape[2]);
-    const int64_t n_seqs = static_cast<int64_t>(x_shape[3]);
-    const int64_t n_group = static_cast<int64_t>(B_shape[1]);
+    state_in = normalize_rank(state_in, state_shape, 4);
+    x_in = normalize_rank(x_in, x_shape, 4);
+    dt_in = normalize_rank(dt_in, dt_shape, 3);
+    A_in = normalize_rank(A_in, A_shape, 2);
+    B_in = normalize_rank(B_in, B_shape, 4);
+    C_in = normalize_rank(C_in, C_shape, 4);
+
+    const int64_t n_state_seqs = static_cast<int64_t>(state_shape[0]);
+    const int64_t n_head = static_cast<int64_t>(state_shape[1]);
+    const int64_t head_dim = static_cast<int64_t>(state_shape[2]);
+    const int64_t d_state = static_cast<int64_t>(state_shape[3]);
+    const int64_t n_seqs = static_cast<int64_t>(x_shape[0]);
+    const int64_t n_tokens = static_cast<int64_t>(x_shape[1]);
+    const int64_t n_group = static_cast<int64_t>(B_shape[2]);
 
     FRONT_END_GENERAL_CHECK(n_state_seqs >= n_seqs, "SSM_SCAN state buffer smaller than batch");
-    FRONT_END_GENERAL_CHECK(x_shape[0] == state_shape[1] && x_shape[1] == state_shape[2],
+    FRONT_END_GENERAL_CHECK(x_shape[2] == state_shape[1] && x_shape[3] == state_shape[2],
                             "SSM_SCAN head shape mismatch");
-    FRONT_END_GENERAL_CHECK(dt_shape[0] == static_cast<size_t>(n_head) && dt_shape[1] == x_shape[2] &&
-                                dt_shape[2] == x_shape[3],
+    FRONT_END_GENERAL_CHECK(dt_shape[0] == static_cast<size_t>(n_seqs) && dt_shape[1] == x_shape[1] &&
+                                dt_shape[2] == x_shape[2],
                             "SSM_SCAN dt shape mismatch");
-    FRONT_END_GENERAL_CHECK(B_shape[0] == static_cast<size_t>(d_state) && C_shape == B_shape,
+    FRONT_END_GENERAL_CHECK(B_shape[0] == static_cast<size_t>(n_seqs) && B_shape[1] == x_shape[1] &&
+                                B_shape[3] == static_cast<size_t>(d_state) && C_shape == B_shape,
                             "SSM_SCAN B/C shape mismatch");
     FRONT_END_GENERAL_CHECK(n_head % n_group == 0 && n_group > 0, "SSM_SCAN invalid group configuration");
 
-    const bool is_mamba2 = A_shape[0] == 1;
+    const bool is_mamba2 = A_shape[1] == 1;
 
     auto axis0 = make_const({1}, {0});
+    auto axis1 = make_const({1}, {1});
     auto axis2 = make_const({1}, {2});
     auto axis3 = make_const({1}, {3});
 
-    // Gather initial state by ids along sequence dimension (axis = 3)
-    auto ids_i64 = std::make_shared<ov::op::v0::Convert>(ids_in, ov::element::i64);
-    auto gather_axis = make_const({}, {3});
+    // Gather initial state by ids along sequence dimension (axis = 0)
+    ov::Output<ov::Node> ids_i64 = std::make_shared<ov::op::v0::Convert>(ids_in, ov::element::i64);
+    ids_i64 = std::make_shared<ov::op::v1::Reshape>(ids_i64, make_const({1}, {n_seqs}), false);
+    auto gather_axis = make_const({}, {0});
     auto gathered_state = std::make_shared<ov::op::v1::Gather>(state_in, ids_i64, gather_axis);
 
-    // Reorder layout to [n_seqs, n_head, dim, d_state]
-    auto state_perm = make_const({4}, {3, 2, 1, 0});
-    ov::Output<ov::Node> state_cur = std::make_shared<ov::op::v1::Transpose>(gathered_state, state_perm);
+    // Layout already matches [n_seqs, n_head, head_dim, d_state]
+    ov::Output<ov::Node> state_cur = gathered_state;
 
     // Transpose inputs for easier token slicing
-    auto x_perm = std::make_shared<ov::op::v1::Transpose>(x_in, make_const({4}, {3, 1, 0, 2}));
-    auto dt_perm = std::make_shared<ov::op::v1::Transpose>(dt_in, make_const({3}, {2, 0, 1}));
-    auto B_perm = std::make_shared<ov::op::v1::Transpose>(B_in, make_const({4}, {3, 1, 0, 2}));
-    auto C_perm = std::make_shared<ov::op::v1::Transpose>(C_in, make_const({4}, {3, 1, 0, 2}));
+    auto x_perm = std::make_shared<ov::op::v1::Transpose>(x_in, make_const({4}, {0, 2, 3, 1}));
+    auto dt_perm = std::make_shared<ov::op::v1::Transpose>(dt_in, make_const({3}, {0, 2, 1}));
+    auto B_perm = std::make_shared<ov::op::v1::Transpose>(B_in, make_const({4}, {0, 2, 3, 1}));
+    auto C_perm = std::make_shared<ov::op::v1::Transpose>(C_in, make_const({4}, {0, 2, 3, 1}));
 
     // group mapping for B/C gather
     std::vector<int64_t> group_map(static_cast<size_t>(n_head));
@@ -162,26 +226,24 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
     y_tokens.reserve(static_cast<size_t>(n_tokens));
 
     for (int64_t t = 0; t < n_tokens; ++t) {
-        // Slice token t
-        auto token_begin4 = make_const({4}, {0, 0, 0, t});
-        auto token_end4 = make_const({4}, {n_seqs, n_head, head_dim, t + 1});
-        auto strides4 = make_const({4}, {1, 1, 1, 1});
-        auto x_slice = std::make_shared<ov::op::v8::Slice>(x_perm, token_begin4, token_end4, strides4);
-        auto x_step = std::make_shared<ov::op::v0::Squeeze>(x_slice, axis3);  // [n_seqs, n_head, head_dim]
+        // Select token t
+        auto token_idx = make_const({1}, {t});
+        auto axis_tokens4 = make_const({}, {3});
+        auto axis_tokens3 = make_const({}, {2});
 
-        auto token_begin3 = make_const({3}, {0, 0, t});
-        auto token_end3 = make_const({3}, {n_seqs, n_head, t + 1});
-        auto strides3 = make_const({3}, {1, 1, 1});
-        auto dt_slice = std::make_shared<ov::op::v8::Slice>(dt_perm, token_begin3, token_end3, strides3);
-        auto dt_step = std::make_shared<ov::op::v0::Squeeze>(dt_slice, axis2);  // [n_seqs, n_head]
+        auto x_gather = std::make_shared<ov::op::v1::Gather>(x_perm, token_idx, axis_tokens4);
+        auto x_step = std::make_shared<ov::op::v0::Squeeze>(x_gather, axis3);  // [n_seqs, n_head, head_dim]
+
+        auto dt_gather = std::make_shared<ov::op::v1::Gather>(dt_perm, token_idx, axis_tokens3);
+        auto dt_step = std::make_shared<ov::op::v0::Squeeze>(dt_gather, axis2);  // [n_seqs, n_head]
         auto dt_softplus = std::make_shared<ov::op::v4::SoftPlus>(dt_step);
 
-        auto BC_begin = make_const({4}, {0, 0, 0, t});
-        auto BC_end = make_const({4}, {n_seqs, n_group, d_state, t + 1});
-        auto BC_slice = std::make_shared<ov::op::v8::Slice>(B_perm, BC_begin, BC_end, strides4);
-        auto B_step = std::make_shared<ov::op::v0::Squeeze>(BC_slice, axis3);  // [n_seqs, n_group, d_state]
-        BC_slice = std::make_shared<ov::op::v8::Slice>(C_perm, BC_begin, BC_end, strides4);
-        auto C_step = std::make_shared<ov::op::v0::Squeeze>(BC_slice, axis3);  // [n_seqs, n_group, d_state]
+        auto axis_tokens_bc = make_const({}, {3});
+        auto B_gather = std::make_shared<ov::op::v1::Gather>(B_perm, token_idx, axis_tokens_bc);
+        auto B_step = std::make_shared<ov::op::v0::Squeeze>(B_gather, axis3);  // [n_seqs, n_group, d_state]
+
+        auto C_gather = std::make_shared<ov::op::v1::Gather>(C_perm, token_idx, axis_tokens_bc);
+        auto C_step = std::make_shared<ov::op::v0::Squeeze>(C_gather, axis3);  // [n_seqs, n_group, d_state]
 
         auto B_head = std::make_shared<ov::op::v1::Gather>(B_step, group_indices, gather_group_axis);
         auto C_head = std::make_shared<ov::op::v1::Gather>(C_step, group_indices, gather_group_axis);
@@ -192,7 +254,7 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
 
         ov::Output<ov::Node> dA_broadcast;
         if (is_mamba2) {
-            auto A_squeezed = std::make_shared<ov::op::v0::Squeeze>(A_in, axis0);  // [n_head]
+            auto A_squeezed = std::make_shared<ov::op::v0::Squeeze>(A_in, axis1);  // [n_head]
             auto A_unsqueezed = std::make_shared<ov::op::v0::Unsqueeze>(A_squeezed, axis0); // [1, n_head]
             auto target = make_const({2}, {n_seqs, n_head});
             auto A_broadcast = std::make_shared<ov::op::v3::Broadcast>(A_unsqueezed, target);
@@ -200,8 +262,7 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
             auto dA = std::make_shared<ov::op::v0::Exp>(dtA);  // [n_seqs, n_head]
             dA_broadcast = std::make_shared<ov::op::v0::Unsqueeze>(dA, make_const({2}, {2, 3}));
         } else {
-            auto A_perm = std::make_shared<ov::op::v1::Transpose>(A_in, make_const({2}, {1, 0}));  // [n_head, d_state]
-            auto A_expand = std::make_shared<ov::op::v0::Unsqueeze>(A_perm, axis0);               // [1, n_head, d_state]
+            auto A_expand = std::make_shared<ov::op::v0::Unsqueeze>(A_in, axis0);                 // [1, n_head, d_state]
             auto dt_expanded = std::make_shared<ov::op::v0::Unsqueeze>(dt_softplus, axis2);       // [n_seqs, n_head, 1]
             auto dtA = std::make_shared<ov::op::v1::Multiply>(dt_expanded, A_expand);             // [n_seqs, n_head, d_state]
             auto dA = std::make_shared<ov::op::v0::Exp>(dtA);
@@ -226,17 +287,23 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
     FRONT_END_GENERAL_CHECK(!y_tokens.empty(), "SSM_SCAN requires at least one token");
 
     auto y_concat = std::make_shared<ov::op::v0::Concat>(y_tokens, 2);  // [n_seqs, n_head, n_tokens, head_dim]
-    auto y_perm = make_const({4}, {3, 1, 2, 0});                        // -> [head_dim, n_head, n_tokens, n_seqs]
+    auto y_perm = make_const({4}, {0, 2, 1, 3});                        // -> [n_seqs, n_tokens, n_head, head_dim]
     auto y_out = std::make_shared<ov::op::v1::Transpose>(y_concat, y_perm);
 
     const int64_t y_elements = head_dim * n_head * n_tokens * n_seqs;
     auto y_flat = std::make_shared<ov::op::v1::Reshape>(y_out, make_const({1}, {y_elements}), false);
 
-    auto state_out = std::make_shared<ov::op::v1::Transpose>(state_cur, make_const({4}, {3, 2, 1, 0}));
+    auto state_out = state_cur;
     const int64_t state_elements = d_state * head_dim * n_head * n_seqs;
     auto state_flat = std::make_shared<ov::op::v1::Reshape>(state_out, make_const({1}, {state_elements}), false);
 
-    auto result = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{y_flat, state_flat}, 0);
+    ov::Output<ov::Node> result = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{y_flat, state_flat}, 0);
+    const auto output_shape = context.get_output_shape().to_shape();
+    if (!output_shape.empty()) {
+        std::vector<int64_t> target_shape(output_shape.begin(), output_shape.end());
+        auto shape_const = ov::op::v0::Constant::create(ov::element::i64, {target_shape.size()}, target_shape);
+        result = std::make_shared<ov::op::v1::Reshape>(result, shape_const, false);
+    }
 
     return rename_outputs_with_suffix({result}, context.get_name());
 }

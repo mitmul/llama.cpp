@@ -27,16 +27,38 @@ OutputVector translate_cont(const NodeContext & context) {
 
     if (op_case == 1) {
         // The input comes from a PERMUTE
-        throw std::runtime_error("Code of this case might be outdated");
-        dst_shape[1] = -1;
+        std::vector<int64_t> target_shape(dst_shape.begin(), dst_shape.end());
         res = std::make_shared<ov::op::v1::Reshape>(
-            context.get_input(0), ov::op::v0::Constant::create(ov::element::i64, {dst_shape.size()}, dst_shape), false);
+            context.get_input(0),
+            ov::op::v0::Constant::create(ov::element::i64, {target_shape.size()}, target_shape),
+            false);
     } else if (op_case == 2) {
         // The input comes from a TRANSPOSE
         return {context.get_input(0)};
     } else {
         // The input comes from a VIEW
-        res = process_view_input(context, 0);
+        auto input = context.get_input(0);
+        auto out_shape = context.get_output_shape().to_shape();
+        if (!out_shape.empty()) {
+            const auto in_shape = context.get_input_shape(0).to_shape();
+            auto numel = [](const std::vector<size_t> & dims) {
+                size_t total = 1;
+                for (auto d : dims) {
+                    total *= d;
+                }
+                return total;
+            };
+            if (numel(in_shape) == numel(out_shape)) {
+                std::vector<int64_t> target_shape(out_shape.begin(), out_shape.end());
+                auto shape_const =
+                    ov::op::v0::Constant::create(ov::element::i64, {target_shape.size()}, target_shape);
+                res = std::make_shared<ov::op::v1::Reshape>(input, shape_const, false);
+            } else {
+                res = process_view_input(context, 0);
+            }
+        } else {
+            res = process_view_input(context, 0);
+        }
     }
 
     return rename_outputs_with_suffix({res}, context.get_name());

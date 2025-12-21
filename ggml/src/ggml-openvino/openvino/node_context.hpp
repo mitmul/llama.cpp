@@ -3,8 +3,11 @@
 #include <cstdint>
 #include <openvino/frontend/node_context.hpp>
 #include <string>
+#include <sstream>
 
 #include "decoder.hpp"
+#include "ggml.h"
+#include "ggml-impl.h"
 
 namespace ov {
 namespace frontend {
@@ -66,14 +69,11 @@ public:
     }
 
     Output<Node> get_input(int idx) const override {
-        return m_tensor_map->at(m_input_names[idx]);
+        return get_input_internal(m_input_names.at(idx));
     }
 
     Output<Node> get_input(const std::string& name) const override {
-        if (m_tensor_map->find(name) == m_tensor_map->end()) {
-            throw std::runtime_error("'" + name + "' not found in tensor map.");
-        }
-        return m_tensor_map->at(name);
+        return get_input_internal(name);
     }
 
     bool has_input(const std::string& name) const {
@@ -100,6 +100,60 @@ private:
     TranslateSession* m_translate_session;
     std::vector<std::string> m_input_names;
     std::vector<std::string> m_output_names;
+
+    Output<Node> get_input_internal(const std::string & name) const {
+        auto it = m_tensor_map->find(name);
+        if (it != m_tensor_map->end()) {
+            return it->second;
+        }
+
+        auto pos = name.find(' ');
+        if (pos != std::string::npos) {
+            auto alt_name = name.substr(pos + 1);
+            auto alt_it = m_tensor_map->find(alt_name);
+            if (alt_it != m_tensor_map->end()) {
+                GGML_LOG_WARN("GGML OpenVINO Backend: tensor_map missing key '%s', using alias '%s'\n", name.c_str(),
+                              alt_name.c_str());
+                return alt_it->second;
+            }
+        }
+        auto paren = name.find('(');
+        if (paren != std::string::npos) {
+            auto alt_name = name.substr(paren);
+            while (!alt_name.empty() && alt_name.front() == ' ') {
+                alt_name.erase(alt_name.begin());
+            }
+            auto alt_it = m_tensor_map->find(alt_name);
+            if (alt_it != m_tensor_map->end()) {
+                GGML_LOG_WARN("GGML OpenVINO Backend: tensor_map missing key '%s', using paren alias '%s'\n",
+                              name.c_str(), alt_name.c_str());
+                return alt_it->second;
+            }
+        }
+        for (const auto & kv : *m_tensor_map) {
+            const auto & candidate = kv.first;
+            if (name.size() >= candidate.size() &&
+                name.compare(name.size() - candidate.size(), candidate.size(), candidate) == 0) {
+                GGML_LOG_WARN("GGML OpenVINO Backend: tensor_map missing key '%s', using suffix match '%s'\n",
+                              name.c_str(), candidate.c_str());
+                return kv.second;
+            }
+        }
+
+        std::ostringstream oss;
+        oss << "tensor_map missing key '" << name << "' for node '" << get_name() << "'. available=[";
+        bool first = true;
+        for (const auto & kv : *m_tensor_map) {
+            if (!first) {
+                oss << ", ";
+            }
+            oss << kv.first;
+            first = false;
+        }
+        oss << "]";
+        GGML_LOG_ERROR("GGML OpenVINO Backend: %s\n", oss.str().c_str());
+        throw std::out_of_range(oss.str());
+    }
 };
 
 using CreatorFunction = std::function<ov::OutputVector(const ov::frontend::ggml::NodeContext&)>;

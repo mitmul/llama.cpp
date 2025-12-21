@@ -7,6 +7,8 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <openvino/openvino.hpp>
 #include <set>
@@ -301,6 +303,16 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         }
         break;
     }
+    case GGML_OP_SSM_CONV:
+    case GGML_OP_SSM_SCAN: {
+        const char * disable_ssm = getenv("GGML_OPENVINO_DISABLE_SSM");
+        if (disable_ssm && strcmp(disable_ssm, "0") != 0) {
+            GGML_LOG_WARN("OpenVINO backend disabled SSM op %s via GGML_OPENVINO_DISABLE_SSM\n",
+                          ggml_op_name(op->op));
+            return true;
+        }
+        break;
+    }
     default:
         break;
     }
@@ -309,6 +321,21 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
 
 static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(dev->reg != nullptr);
+
+    // OpenVINO does not reliably handle zero-sized tensors (one or more dimensions == 0).
+    // These appear in recurrent-state bookkeeping paths (e.g. n_rs == n_seqs) and are
+    // effectively no-ops, so keep them on the CPU backend.
+    if (ggml_is_empty(op)) {
+        return false;
+    }
+
+    // Optional safety mode: only offload SSM ops to OpenVINO.
+    // This avoids conversion failures for larger mixed graphs on some models.
+    if (const char * ssm_only = getenv("GGML_OPENVINO_SSM_ONLY"); ssm_only && strcmp(ssm_only, "0") != 0) {
+        if (op->op != GGML_OP_SSM_CONV && op->op != GGML_OP_SSM_SCAN) {
+            return false;
+        }
+    }
 
     static std::set<ggml_type> supported_types{GGML_TYPE_F32,  GGML_TYPE_F16,  GGML_TYPE_BF16, GGML_TYPE_I64,
                                                GGML_TYPE_I32,  GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
@@ -364,6 +391,9 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
         auto * src = op->src[i];
         if (src == nullptr) {
             break;
+        }
+        if (ggml_is_empty(src)) {
+            return false;
         }
         if (supported_types.find(src->type) == supported_types.end()) {
             GGML_LOG_WARN("OpenVINO backend does not support tensor type %s\n", ggml_type_name(src->type));

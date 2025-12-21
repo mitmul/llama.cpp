@@ -34,6 +34,7 @@
         #define PATH_MAX MAX_PATH
     #endif
     #include <io.h>
+    #include <fcntl.h>
 #endif
 
 #if defined(__APPLE__)
@@ -76,11 +77,75 @@ struct llama_file::impl {
     }
 
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
-        fp = ggml_fopen(fname, mode);
-        if (fp == NULL) {
-            throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+        // Open via Win32 API first to avoid CRT invalid-parameter fail-fast, then attach a CRT FILE*
+        auto utf8_to_wstring = [](const char * utf8) -> std::wstring {
+            if (utf8 == nullptr) {
+                throw std::runtime_error("null filename");
+            }
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+            if (wlen <= 0) {
+                throw std::runtime_error(format("failed to convert path %s to wide string", utf8));
+            }
+            std::wstring buf(static_cast<size_t>(wlen), L'\0');
+            int res = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, buf.data(), wlen);
+            if (res <= 0) {
+                throw std::runtime_error(format("failed to convert path %s to wide string", utf8));
+            }
+            // strip trailing null added by MultiByteToWideChar
+            if (!buf.empty() && buf.back() == L'\0') {
+                buf.pop_back();
+            }
+            return buf;
+        };
+
+        std::wstring wfname = utf8_to_wstring(fname);
+
+        DWORD desired_access = 0;
+        if (std::strchr(mode, 'r')) {
+            desired_access |= GENERIC_READ;
         }
-        fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
+        if (std::strchr(mode, 'w')) {
+            desired_access |= GENERIC_WRITE;
+        }
+        if (desired_access == 0) {
+            desired_access = GENERIC_READ;
+        }
+
+        DWORD creation_disposition = OPEN_EXISTING;
+        if (std::strchr(mode, 'w')) {
+            creation_disposition = CREATE_ALWAYS;
+        } else if (std::strchr(mode, 'a')) {
+            creation_disposition = OPEN_ALWAYS;
+        }
+
+        fp_win32 = CreateFileW(wfname.c_str(),
+                               desired_access,
+                               FILE_SHARE_READ,
+                               NULL,
+                               creation_disposition,
+                               FILE_ATTRIBUTE_NORMAL,
+                               NULL);
+
+        if (fp_win32 == INVALID_HANDLE_VALUE) {
+            throw std::runtime_error(format("failed to open %s: %s", fname,
+                                            GetErrorMessageWin32(GetLastError()).c_str()));
+        }
+
+        const int oflag = (desired_access & GENERIC_WRITE) ? _O_RDWR : _O_RDONLY;
+        int fd = _open_osfhandle((intptr_t) fp_win32, _O_BINARY | oflag);
+        if (fd == -1) {
+            DWORD err = GetLastError();
+            CloseHandle(fp_win32);
+            throw std::runtime_error(format("failed to associate file handle for %s: %s", fname,
+                                            GetErrorMessageWin32(err).c_str()));
+        }
+
+        fp = _fdopen(fd, mode);
+        if (fp == nullptr) {
+            CloseHandle(fp_win32);
+            throw std::runtime_error(format("failed to open FILE* for %s: %s", fname, strerror(errno)));
+        }
+
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);

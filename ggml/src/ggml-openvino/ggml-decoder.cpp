@@ -31,9 +31,52 @@
 #include <optional>
 #include <ostream>
 #include <set>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
+#include <sstream>
 #include <vector>
+
+namespace {
+
+template <typename Map>
+const typename Map::mapped_type & map_at_checked(const Map & m,
+                                                 const std::string & key,
+                                                 const char * ctx) {
+    auto it = m.find(key);
+    if (it != m.end()) {
+        return it->second;
+    }
+
+    std::ostringstream oss;
+    oss << ctx << " missing key '" << key << "'. available=[";
+    bool first = true;
+    for (const auto & kv : m) {
+        if (!first) {
+            oss << ", ";
+        }
+        oss << kv.first;
+        first = false;
+    }
+    oss << "]";
+    GGML_LOG_ERROR("GGML OpenVINO Backend: %s\n", oss.str().c_str());
+    throw std::out_of_range(oss.str());
+}
+
+const GgmlOvDecoder::NodeInfo & get_node_info_checked(
+    const std::vector<GgmlOvDecoder::NodeInfo> & nodes,
+    int node_idx,
+    const char * ctx) {
+    if (node_idx < 0 || node_idx >= static_cast<int>(nodes.size())) {
+        std::ostringstream oss;
+        oss << ctx << " node_idx " << node_idx << " out of range, size=" << nodes.size();
+        GGML_LOG_ERROR("GGML OpenVINO Backend: %s\n", oss.str().c_str());
+        throw std::out_of_range(oss.str());
+    }
+    return nodes[node_idx];
+}
+
+}  // namespace
 
 GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
                              ModelParams & model_params,
@@ -68,6 +111,28 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         m_node_info_list[node_n].node_op_case = compute_op_case(m_node_info_list[node_n].node);
         m_node_info_list[node_n].node_op_type = compute_op_type(m_node_info_list[node_n].node);
+    }
+
+    // Treat any referenced tensor that is not produced inside this graph or provided as a weight/input as a model input.
+    // This covers tensors computed on other backends (e.g., CPU) that feed into the OpenVINO subgraph.
+    std::unordered_set<std::string> produced_names;
+    for (const auto & node_info : m_node_info_list) {
+        produced_names.insert(node_info.node_output_name);
+    }
+    for (const auto & node_info : m_node_info_list) {
+        for (const auto & kv : node_info.node_inputs) {
+            const auto & src_name = kv.first;
+            auto * src = kv.second;
+            if (produced_names.count(src_name) || m_model_weights.count(src_name) || m_model_inputs.count(src_name)) {
+                continue;
+            }
+            m_inputs[src_name] = src;
+            auto param_node =
+                std::make_shared<ov::op::v0::Parameter>(get_ov_type(src), get_graph_input_shape(node_info.node, src));
+            param_node->set_friendly_name(src_name);
+            param_node->output(0).get_tensor().set_names({src_name});
+            m_model_inputs[src_name] = param_node;
+        }
     }
 
     add_extra_inputs();
@@ -503,7 +568,10 @@ std::map<std::string, std::shared_ptr<ov::Node>> GgmlOvDecoder::create_weight_no
                     }
                     if (should_create) {
                         auto requant_type = types_to_requantize.count(src->type) ?
-                                                std::optional<ExtraQuantType>(types_to_requantize.at(src->type)) :
+                                                [&]() -> std::optional<ExtraQuantType> {
+                                                    auto it = types_to_requantize.find(src->type);
+                                                    return it != types_to_requantize.end() ? std::optional<ExtraQuantType>(it->second) : std::nullopt;
+                                                }() :
                                                 std::nullopt;
                         auto weight_node = create_weight_node(src, requant_type);
                         weight_node->set_friendly_name(src_name);
@@ -740,16 +808,31 @@ ov::element::Type GgmlOvDecoder::get_ov_type(const ggml_tensor * tensor) {
     }
 }
 
+ggml_tensor * GgmlOvDecoder::get_input_ggml_tensor(const std::string & name) const {
+    return map_at_checked(m_inputs, name, "get_input_ggml_tensor");
+}
+
+int GgmlOvDecoder::get_op_case(int node_idx) const {
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_op_case");
+    return node_info.node_op_case;
+}
+
 ov::PartialShape GgmlOvDecoder::get_input_shape(int node_idx, const std::string & name) const {
-    return ov::PartialShape(get_shape(m_node_info_list[node_idx].node_inputs.at(name)));
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_shape");
+    const auto & input = map_at_checked(node_info.node_inputs, name, "get_input_shape");
+    return ov::PartialShape(get_shape(input));
 }
 
 std::vector<size_t> GgmlOvDecoder::get_input_stride(int node_idx, const std::string & name) const {
-    return get_stride(m_node_info_list[node_idx].node_inputs.at(name));
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_stride");
+    const auto & input = map_at_checked(node_info.node_inputs, name, "get_input_stride");
+    return get_stride(input);
 }
 
 ov::element::Type GgmlOvDecoder::get_input_type(int node_idx, const std::string & name) const {
-    return get_ov_type(m_node_info_list[node_idx].node_inputs.at(name));
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_type");
+    const auto & input = map_at_checked(node_info.node_inputs, name, "get_input_type");
+    return get_ov_type(input);
 }
 
 size_t GgmlOvDecoder::get_input_size() const {
@@ -757,24 +840,29 @@ size_t GgmlOvDecoder::get_input_size() const {
 }
 
 size_t GgmlOvDecoder::get_input_size(int node_idx) const {
-    return m_node_info_list[node_idx].node_inputs_names.size();
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_size");
+    return node_info.node_inputs_names.size();
 }
 
 std::vector<std::string> GgmlOvDecoder::get_input_names(int node_idx) const {
-    return m_node_info_list[node_idx].node_inputs_names;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_names");
+    return node_info.node_inputs_names;
 }
 
 ov::PartialShape GgmlOvDecoder::get_output_shape(int node_idx) const {
-    auto * ggml_tensor = m_node_info_list[node_idx].node_output;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_output_shape");
+    auto * ggml_tensor = node_info.node_output;
     return ov::PartialShape(get_shape(ggml_tensor));
 }
 
 ov::element::Type GgmlOvDecoder::get_output_type(const int node_idx) const {
-    return get_ov_type(m_node_info_list[node_idx].node);
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_output_type");
+    return get_ov_type(node_info.node);
 }
 
 std::vector<std::string> GgmlOvDecoder::get_output_names(int node_idx) const {
-    return {m_node_info_list[node_idx].node_output_name};
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_output_names");
+    return {node_info.node_output_name};
 }
 
 const std::string & GgmlOvDecoder::get_op_name() const {
@@ -783,15 +871,19 @@ const std::string & GgmlOvDecoder::get_op_name() const {
 }
 
 const std::string & GgmlOvDecoder::get_op_name(int node_idx) const {
-    return m_node_info_list[node_idx].node_name;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_op_name");
+    return node_info.node_name;
 }
 
 int32_t * GgmlOvDecoder::get_input_op_params(int node_idx, const std::string & name) const {
-    return m_node_info_list[node_idx].node_inputs.at(name)->op_params;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_input_op_params");
+    const auto & input = map_at_checked(node_info.node_inputs, name, "get_input_op_params");
+    return input->op_params;
 }
 
 int32_t * GgmlOvDecoder::get_output_op_params(int node_idx) const {
-    return m_node_info_list[node_idx].node->op_params;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_output_op_params");
+    return node_info.node->op_params;
 }
 
 void GgmlOvDecoder::visit_subgraph(std::function<void(std::shared_ptr<GgmlDecoder>, int node_idx)> node_visitor) const {
@@ -819,6 +911,7 @@ std::string GgmlOvDecoder::compute_op_type(const ggml_tensor * node) {
         {GGML_OP_SCALE,          "GGML_OP_SCALE"         },
         {GGML_OP_SOFT_MAX,       "GGML_OP_SOFT_MAX"      },
         {GGML_OP_SUB,            "GGML_OP_SUB"           },
+        {GGML_OP_CONCAT,         "GGML_OP_CONCAT"        },
         {GGML_OP_TRANSPOSE,      "GGML_OP_TRANSPOSE"     },
         {GGML_OP_SSM_CONV,       "GGML_OP_SSM_CONV"      },
         {GGML_OP_SSM_SCAN,       "GGML_OP_SSM_SCAN"      },
@@ -851,19 +944,36 @@ std::string GgmlOvDecoder::compute_op_type(const ggml_tensor * node) {
     };
 
     switch (node->op) {
-    case GGML_OP_UNARY:
-        return unary_ops.at(ggml_get_unary_op(node));
-    case GGML_OP_GLU:
-        return glu_ops.at(ggml_get_glu_op(node));
-    default:
-        return ops.at(node->op);
+    case GGML_OP_UNARY: {
+        auto it = unary_ops.find(ggml_get_unary_op(node));
+        if (it != unary_ops.end()) {
+            return it->second;
+        }
+        break;
+    }
+    case GGML_OP_GLU: {
+        auto it = glu_ops.find(ggml_get_glu_op(node));
+        if (it != glu_ops.end()) {
+            return it->second;
+        }
+        break;
+    }
+    default: {
+        auto it = ops.find(node->op);
+        if (it != ops.end()) {
+            return it->second;
+        }
+        break;
+    }
     }
     static const std::string unknown_op = "UNKNOWN_GGML_OP";
+    GGML_LOG_ERROR("GGML OpenVINO Backend: unsupported op %d for tensor %s\n", node->op, node->name);
     return unknown_op;
 }
 
 const std::string & GgmlOvDecoder::get_op_type(int node_idx) const {
-    return m_node_info_list[node_idx].node_op_type;
+    const auto & node_info = get_node_info_checked(m_node_info_list, node_idx, "get_op_type");
+    return node_info.node_op_type;
 }
 
 const std::string & GgmlOvDecoder::get_op_type() const {

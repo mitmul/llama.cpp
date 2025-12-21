@@ -119,9 +119,9 @@ public:
 
     virtual void visit_subgraph(std::function<void(std::shared_ptr<GgmlDecoder>, int node_idx)> node_visitor) const override;
 
-    ggml_tensor * get_input_ggml_tensor(const std::string & name) const { return m_inputs.at(name); }
+    ggml_tensor * get_input_ggml_tensor(const std::string & name) const;
 
-    virtual int get_op_case(int node_idx) const override { return m_node_info_list[node_idx].node_op_case; }
+    virtual int get_op_case(int node_idx) const override;
 
     virtual const std::map<std::string, std::shared_ptr<ov::Node>> & get_model_inputs() const override {
         return m_model_inputs;
