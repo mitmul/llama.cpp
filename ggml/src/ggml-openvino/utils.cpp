@@ -1,6 +1,7 @@
 #include "utils.h"
 
 #include "ggml-impl.h"
+#include "ggml-backend.h"
 #include "ggml-openvino/ggml-decoder.h"
 #include "ggml.h"
 #include "openvino/frontend.hpp"
@@ -55,7 +56,12 @@ enum ggml_status ov_graph_compute(ggml_cgraph * cgraph) {
     }
 
     static const auto device = get_device();
-    static const auto is_static = device == "NPU" ? true : false;
+    static const bool force_dynamic = [] {
+        const char * env = getenv("GGML_OPENVINO_FORCE_DYNAMIC");
+        return env && std::string(env) != "0";
+    }();
+
+    const bool is_static = device == "NPU" && !force_dynamic;
     return is_static ? ov_graph_compute_static(cgraph) : ov_graph_compute_dynamic(cgraph, device);
 }
 
@@ -231,6 +237,9 @@ enum ggml_status ov_graph_compute_dynamic(ggml_cgraph * cgraph, const std::strin
 }
 
 enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
+    const char * stage = "init";
+    const auto key = compute_graph_key(cgraph);
+    try {
     auto get_prefill_chunk_size = [] {
         const char * chunk_size_str = getenv("GGML_OPENVINO_PREFILL_CHUNK_SIZE");
         if (chunk_size_str && atoi(chunk_size_str) > 0) {
@@ -244,8 +253,37 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
     static auto prefill_chunk_size = get_prefill_chunk_size();
     static auto config = get_ov_compile_config(device);
 
+    auto find_inp_pos_tensor = [](ggml_cgraph * graph) -> const ggml_tensor * {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            auto * op = graph->nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                auto * src = op->src[j];
+                if (src == nullptr) {
+                    break;
+                }
+                if (std::string(src->name) == "inp_pos") {
+                    return src;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    const auto * inp_pos = find_inp_pos_tensor(cgraph);
+    if (inp_pos == nullptr) {
+        // Some backend-scheduled subgraphs (e.g. SSM-only paths) do not reference inp_pos.
+        // The static OpenVINO frontend path can be unstable for these graphs, so fall back
+        // to the naive converter on the CPU plugin.
+        stage = "fallback_naive_no_inp_pos";
+        return naive_compute(cgraph, core, "CPU", get_ov_compile_config("CPU"));
+    }
+
     if (is_naive(cgraph)) {
-        return naive_compute(cgraph, core, device, config);
+        // The Intel NPU plugin is strict about IO tensor element types for these tiny "naive" graphs and
+        // can fail with f32/f16 mismatches. Run them on the CPU plugin instead so the main LLM graphs can
+        // still execute on the NPU.
+        stage = "fallback_naive_small_graph";
+        return naive_compute(cgraph, core, "CPU", get_ov_compile_config("CPU"));
     }
 
     auto start_time = ggml_time_us();
@@ -261,31 +299,41 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
     std::shared_ptr<ov::InferRequest> infer_request;
     ModelParams m_params;
     ComputeParams c_params;
+    stage = "compute_llm_params";
     std::tie(m_params, c_params) = GgmlOvDecoder::compute_llm_params(cgraph, is_static);
+    stage = "cache_lock";
 
-    const auto * inp_pos = get_inp_pos_tensor(cgraph);
-    const auto is_prefill = get_is_prefill(inp_pos);
-    const auto key = compute_graph_key(cgraph);
-    bool cache_hit;
+    const bool is_prefill = get_is_prefill(inp_pos);
+    bool cache_hit = false;
 
     int64_t decoder_end_time;
     int64_t conversion_end_time;
     int64_t compile_end_time;
     int64_t infer_end_time;
 
+    std::vector<std::string> ov_input_names;
+    std::vector<std::string> ov_output_names;
+
+    stage = "cache_lookup";
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
 
         auto it = decoder_cache.find(key);
-
         cache_hit = it != decoder_cache.end();
         if (cache_hit) {
             ggml_decoder = it->second;
             cache_hit = ggml_decoder->get_model_params().can_reuse_statically(m_params);
+            if (!cache_hit) {
+                decoder_cache.erase(key);
+                infer_request_cache.erase(key);
+                infer_request_cache_prefill.erase(key);
+                ov_input_names_cache.erase(key);
+                ov_output_names_cache.erase(key);
+            }
         }
 
         if (cache_hit) {
-            std::map<std::string, std::shared_ptr<ov::Node>> model_weights;
+            stage = "cache_hit";
             ggml_decoder = decoder_cache[key];
             ggml_decoder->m_is_prefill = is_prefill;
             ggml_decoder->set_model_params(m_params);
@@ -293,14 +341,25 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
             ggml_decoder->add_extra_inputs();
             infer_request = is_prefill ? infer_request_cache_prefill[key] : infer_request_cache[key];
 
+            ov_input_names = ov_input_names_cache[key];
+            ov_output_names = ov_output_names_cache[key];
+
             decoder_end_time = ggml_time_us();
             conversion_end_time = decoder_end_time;
             compile_end_time = decoder_end_time;
-        } else {
-            infer_request_cache.erase(key);
-            infer_request_cache_prefill.erase(key);
+        }
+    }
 
+    if (!cache_hit) {
+        stage = "build_models";
+
+        std::shared_ptr<ov::InferRequest> infer_request_prefill;
+        std::shared_ptr<ov::InferRequest> infer_request_decode;
+
+        try {
             std::shared_ptr<ov::Model> model;
+
+            stage = "build_model_weights";
             auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph, get_types_to_requant(device));
 
             auto ggml_decoder_prefill = std::make_shared<GgmlOvDecoder>(cgraph, m_params, c_params, model_weights,
@@ -312,6 +371,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
             auto input_model_prefill = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_prefill);
             auto input_model_decode = std::make_shared<ov::frontend::ggml::InputModel>(ggml_decoder_decode);
 
+            stage = "convert_models";
             auto model_prefill = ov::frontend::ggml::FrontEnd::convert(input_model_prefill);
             ggml_decoder_prefill->clear_model_weights();
             auto model_decode = ov::frontend::ggml::FrontEnd::convert(input_model_decode);
@@ -327,36 +387,48 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
                 ov::serialize(model_decode, timestamped_filename);
             }
 
+            stage = "compile_models";
             auto compiled_model_prefill = core.compile_model(model_prefill, device, get_ov_compile_config(device));
             auto compiled_model_decode = core.compile_model(model_decode, device, get_ov_compile_config(device));
 
-            infer_request_cache_prefill[key] =
-                std::make_shared<ov::InferRequest>(compiled_model_prefill.create_infer_request());
-            infer_request_cache[key] = std::make_shared<ov::InferRequest>(compiled_model_decode.create_infer_request());
+            stage = "create_infer_requests";
+            infer_request_prefill = std::make_shared<ov::InferRequest>(compiled_model_prefill.create_infer_request());
+            infer_request_decode = std::make_shared<ov::InferRequest>(compiled_model_decode.create_infer_request());
             compile_end_time = ggml_time_us();
 
             model = is_prefill ? model_prefill : model_decode;
             ggml_decoder = is_prefill ? ggml_decoder_prefill : ggml_decoder_decode;
-            infer_request = is_prefill ? infer_request_cache_prefill[key] : infer_request_cache[key];
-            decoder_cache[key] = ggml_decoder;
+            infer_request = is_prefill ? infer_request_prefill : infer_request_decode;
 
-            std::vector<std::string> ov_input_names;
-            std::vector<std::string> ov_output_names;
             for (const auto & ov_param : model->get_parameters()) {
                 ov_input_names.push_back(ov_param->get_friendly_name());
             }
             for (const auto & ov_output : model->get_results()) {
                 ov_output_names.push_back(ov_output->get_friendly_name());
             }
-            ov_input_names_cache[key] = std::move(ov_input_names);
-            ov_output_names_cache[key] = std::move(ov_output_names);
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("GGML OpenVINO Backend: static path failed (stage=%s first=%s last=%s), fallback to naive/CPU: %s\n",
+                          stage, key.first_node_name.c_str(), key.last_node_name.c_str(), e.what());
+            return naive_compute(cgraph, core, "CPU", get_ov_compile_config("CPU"));
+        } catch (...) {
+            GGML_LOG_WARN("GGML OpenVINO Backend: static path failed (stage=%s first=%s last=%s), fallback to naive/CPU\n",
+                          stage, key.first_node_name.c_str(), key.last_node_name.c_str());
+            return naive_compute(cgraph, core, "CPU", get_ov_compile_config("CPU"));
+        }
+
+        stage = "cache_store";
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            infer_request_cache_prefill[key] = infer_request_prefill;
+            infer_request_cache[key] = infer_request_decode;
+            decoder_cache[key] = ggml_decoder;
+            ov_input_names_cache[key] = ov_input_names;
+            ov_output_names_cache[key] = ov_output_names;
         }
     }
 
-    auto ov_input_names = ov_input_names_cache[key];
-    auto ov_output_names = ov_output_names_cache[key];
-
     if (is_prefill) {
+        stage = "set_inputs_prefill";
         auto inp_len = inp_pos->ne[0];
         for (int chunk_index = 0; chunk_index * prefill_chunk_size < inp_len; chunk_index++) {
             for (size_t i = 0; i < ov_input_names.size(); i++) {
@@ -370,11 +442,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
                 }
             }
 
+            stage = "set_outputs_prefill";
             for (size_t i = 0; i < ov_output_names.size(); i++) {
                 auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
                 infer_request->set_output_tensor(i, output_tensor);
             }
 
+            stage = "infer_prefill";
             infer_request->infer();
 
             if (getenv("GGML_OPENVINO_DEBUG_OUTPUT")) {
@@ -386,6 +460,7 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
         }
         infer_end_time = ggml_time_us();
     } else {
+        stage = "set_inputs_decode";
         for (size_t i = 0; i < ov_input_names.size(); i++) {
             auto param_name = ov_input_names[i];
             auto input_tensor = get_ov_input_tensor_static_decode(ggml_decoder, param_name);
@@ -397,11 +472,13 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
             }
         }
 
+        stage = "set_outputs_decode";
         for (size_t i = 0; i < ov_output_names.size(); i++) {
             auto output_tensor = get_ov_output_tensor(ggml_decoder, ov_output_names[i]);
             infer_request->set_output_tensor(i, output_tensor);
         }
 
+        stage = "infer_decode";
         infer_request->infer();
         infer_end_time = ggml_time_us();
 
@@ -424,6 +501,14 @@ enum ggml_status ov_graph_compute_static(ggml_cgraph * cgraph) {
     }
 
     return GGML_STATUS_SUCCESS;
+    } catch (const std::exception & e) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: static compute exception (stage=%s n_nodes=%zu first=%s last=%s): %s\n",
+                       stage, key.n_nodes, key.first_node_name.c_str(), key.last_node_name.c_str(), e.what());
+    } catch (...) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: static compute unknown exception (stage=%s n_nodes=%zu first=%s last=%s)\n",
+                       stage, key.n_nodes, key.first_node_name.c_str(), key.last_node_name.c_str());
+    }
+    return GGML_STATUS_FAILED;
 }
 
 ov::AnyMap get_ov_compile_config(const std::string & device) {
@@ -468,10 +553,244 @@ bool is_naive(ggml_cgraph * cgraph) {
     return cgraph->n_nodes < naive_graph_size_threshold;
 }
 
+static void copy_ov_tensor_to_ggml(const ov::Tensor & src, ggml_tensor * dst, const std::string & name) {
+    if (dst == nullptr) {
+        return;
+    }
+
+    if (ggml_is_empty(dst)) {
+        return;
+    }
+
+    const size_t n_src = src.get_size();
+    const size_t n_dst = (size_t) ggml_nelements(dst);
+    if (n_src != n_dst) {
+        GGML_LOG_ERROR("GGML OpenVINO Backend: output '%s' element count mismatch: ov=%zu ggml=%zu\n",
+                       name.c_str(), n_src, n_dst);
+        throw std::runtime_error("OpenVINO output element count mismatch for " + name);
+    }
+
+    {
+        // Guard against writing past the underlying allocation for VIEW tensors.
+        const ggml_tensor * root = dst;
+        size_t root_off = 0;
+        while (root->view_src != nullptr) {
+            root_off += root->view_offs;
+            root = root->view_src;
+        }
+
+        // Avoid writing into buffers that are flagged as weights (often mmapped / read-only).
+        if (root->buffer != nullptr && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            if (dst->op == GGML_OP_VIEW || dst->view_src != nullptr) {
+                return;
+            }
+            GGML_LOG_ERROR("GGML OpenVINO Backend: output '%s' targets weights buffer (dst=%s root=%s)\n",
+                           name.c_str(), dst->name, root->name);
+            throw std::runtime_error("OpenVINO attempted to write into weights buffer for " + name);
+        }
+
+        const size_t type_size = ggml_type_size(dst->type);
+        const size_t max_off =
+            ((size_t) (dst->ne[0] > 0 ? (dst->ne[0] - 1) : 0) * dst->nb[0]) +
+            ((size_t) (dst->ne[1] > 0 ? (dst->ne[1] - 1) : 0) * dst->nb[1]) +
+            ((size_t) (dst->ne[2] > 0 ? (dst->ne[2] - 1) : 0) * dst->nb[2]) +
+            ((size_t) (dst->ne[3] > 0 ? (dst->ne[3] - 1) : 0) * dst->nb[3]);
+        const size_t needed = root_off + max_off + type_size;
+        const size_t root_bytes = ggml_nbytes(root);
+        if (needed > root_bytes) {
+            GGML_LOG_ERROR("GGML OpenVINO Backend: output '%s' write would exceed allocation: needed=%zu root_bytes=%zu (dst=%s root=%s)\n",
+                           name.c_str(), needed, root_bytes, dst->name, root->name);
+            throw std::runtime_error("OpenVINO output write exceeds allocation for " + name);
+        }
+    }
+
+    const ov::element::Type src_type = src.get_element_type();
+    const bool dst_contiguous = ggml_is_contiguous(dst);
+
+    if (dst->type == GGML_TYPE_F32) {
+        if (src_type == ov::element::f32) {
+            if (dst_contiguous) {
+                std::memcpy(dst->data, src.data(), ggml_nbytes(dst));
+                return;
+            }
+
+            const auto * src_data = src.data<const float>();
+            for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+                for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                    for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                        for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                            const size_t src_idx =
+                                (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] +
+                                 i0);
+                            const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                            *(float *) ((char *) dst->data + dst_off) = src_data[src_idx];
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (src_type == ov::element::f16) {
+            const auto * src_data = src.data<const ov::float16>();
+            if (dst_contiguous) {
+                auto * dst_data = (float *) dst->data;
+                for (size_t i = 0; i < n_dst; ++i) {
+                    dst_data[i] = (float) src_data[i];
+                }
+                return;
+            }
+
+            for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+                for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                    for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                        for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                            const size_t src_idx =
+                                (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] +
+                                 i0);
+                            const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                            *(float *) ((char *) dst->data + dst_off) = (float) src_data[src_idx];
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    if (dst->type == GGML_TYPE_F16) {
+        if (src_type == ov::element::f16) {
+            if (dst_contiguous) {
+                std::memcpy(dst->data, src.data(), ggml_nbytes(dst));
+                return;
+            }
+
+            const auto * src_data = src.data<const ov::float16>();
+            for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+                for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                    for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                        for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                            const size_t src_idx =
+                                (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] +
+                                 i0);
+                            const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                            *(ggml_fp16_t *) ((char *) dst->data + dst_off) = ggml_fp32_to_fp16((float) src_data[src_idx]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if (src_type == ov::element::f32) {
+            if (dst_contiguous) {
+                ggml_fp32_to_fp16_row(src.data<const float>(), (ggml_fp16_t *) dst->data, (int64_t) n_dst);
+                return;
+            }
+
+            const auto * src_data = src.data<const float>();
+            for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+                for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                    for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                        for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                            const size_t src_idx =
+                                (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] +
+                                 i0);
+                            const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                            *(ggml_fp16_t *) ((char *) dst->data + dst_off) = ggml_fp32_to_fp16(src_data[src_idx]);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    if (dst->type == GGML_TYPE_I32 && src_type == ov::element::i32) {
+        if (dst_contiguous) {
+            std::memcpy(dst->data, src.data(), ggml_nbytes(dst));
+            return;
+        }
+
+        const auto * src_data = src.data<const int32_t>();
+        for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+            for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                    for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                        const size_t src_idx =
+                            (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] + i0);
+                        const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                        *(int32_t *) ((char *) dst->data + dst_off) = src_data[src_idx];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if (dst->type == GGML_TYPE_I64 && src_type == ov::element::i64) {
+        if (dst_contiguous) {
+            std::memcpy(dst->data, src.data(), ggml_nbytes(dst));
+            return;
+        }
+
+        const auto * src_data = src.data<const int64_t>();
+        for (size_t i3 = 0; i3 < (size_t) dst->ne[3]; ++i3) {
+            for (size_t i2 = 0; i2 < (size_t) dst->ne[2]; ++i2) {
+                for (size_t i1 = 0; i1 < (size_t) dst->ne[1]; ++i1) {
+                    for (size_t i0 = 0; i0 < (size_t) dst->ne[0]; ++i0) {
+                        const size_t src_idx =
+                            (((i3 * (size_t) dst->ne[2] + i2) * (size_t) dst->ne[1] + i1) * (size_t) dst->ne[0] + i0);
+                        const size_t dst_off = i3 * dst->nb[3] + i2 * dst->nb[2] + i1 * dst->nb[1] + i0 * dst->nb[0];
+                        *(int64_t *) ((char *) dst->data + dst_off) = src_data[src_idx];
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    GGML_LOG_ERROR("GGML OpenVINO Backend: unsupported output type conversion for '%s': ov=%s ggml=%s\n",
+                   name.c_str(), src_type.get_type_name().c_str(), ggml_type_name(dst->type));
+    throw std::runtime_error("OpenVINO output type mismatch for " + name);
+}
+
+static ov::Tensor convert_ov_tensor_to_type(const ov::Tensor & src, const ov::element::Type & dst_type, const std::string & name) {
+    const auto src_type = src.get_element_type();
+    if (src_type == dst_type) {
+        return src;
+    }
+
+    ov::Tensor dst(dst_type, src.get_shape());
+    const size_t n = src.get_size();
+
+    if (src_type == ov::element::f32 && dst_type == ov::element::f16) {
+        const float * src_data = src.data<const float>();
+        auto * dst_data = dst.data<ov::float16>();
+        for (size_t i = 0; i < n; ++i) {
+            dst_data[i] = ov::float16(src_data[i]);
+        }
+        return dst;
+    }
+
+    if (src_type == ov::element::f16 && dst_type == ov::element::f32) {
+        const auto * src_data = src.data<const ov::float16>();
+        auto * dst_data = dst.data<float>();
+        for (size_t i = 0; i < n; ++i) {
+            dst_data[i] = (float) src_data[i];
+        }
+        return dst;
+    }
+
+    GGML_LOG_ERROR("GGML OpenVINO Backend: unsupported input type conversion for '%s': ov=%s -> %s\n",
+                   name.c_str(), src_type.get_type_name().c_str(), dst_type.get_type_name().c_str());
+    throw std::runtime_error("OpenVINO input type mismatch for " + name);
+}
+
 enum ggml_status naive_compute(ggml_cgraph * cgraph,
                                ov::Core & core,
                                const std::string & device,
                                const ov::AnyMap & config) {
+    const char * stage = "init";
+    try {
     if (cgraph->n_nodes == 1 && (cgraph->nodes[0]->op == GGML_OP_NONE || cgraph->nodes[0]->op == GGML_OP_VIEW)) {
         return GGML_STATUS_SUCCESS;
     }
@@ -479,32 +798,81 @@ enum ggml_status naive_compute(ggml_cgraph * cgraph,
         return GGML_STATUS_FAILED;
     }
 
+    stage = "create_weight_nodes";
     auto model_weights = GgmlOvDecoder::create_weight_nodes(cgraph);
+    stage = "create_decoder";
     auto decoder = std::make_shared<GgmlOvDecoder>(cgraph, model_weights);
+    stage = "create_input_model";
     auto input_model = std::make_shared<ov::frontend::ggml::InputModel>(decoder);
     auto naive = true;
+    stage = "frontend_convert";
     auto model = ov::frontend::ggml::FrontEnd::convert(input_model, naive);
     if (getenv("GGML_OPENVINO_DUMP_IR")) {
         ov::serialize(model, "IR_naive.xml");
     }
-    auto infer_request = core.compile_model(model, device, config).create_infer_request();
+    stage = "compile_model";
+    auto compiled_model = core.compile_model(model, device, config);
+    stage = "create_infer_request";
+    auto infer_request = compiled_model.create_infer_request();
 
+    stage = "set_inputs";
     auto ov_params = model->get_parameters();
     for (size_t i = 0; i < ov_params.size(); i++) {
         auto param_name = ov_params[i]->get_friendly_name();
         auto input_tensor = get_ov_input_tensor(decoder, param_name);
+        input_tensor = convert_ov_tensor_to_type(input_tensor, compiled_model.input(i).get_element_type(), param_name);
         infer_request.set_input_tensor(i, input_tensor);
     }
 
+    stage = "prepare_outputs";
     auto ov_results = model->get_results();
+    std::vector<std::string> ov_result_names;
+    ov_result_names.reserve(ov_results.size());
     for (size_t i = 0; i < ov_results.size(); i++) {
-        auto result_name = ov_results[i]->get_friendly_name();
-        auto output_tensor = get_ov_output_tensor(decoder, result_name);
-        infer_request.set_output_tensor(i, output_tensor);
+        ov_result_names.push_back(ov_results[i]->get_friendly_name());
     }
 
+    for (size_t i = 0; i < ov_result_names.size(); i++) {
+        const auto expected_type = compiled_model.output(i).get_element_type();
+        const auto current = infer_request.get_output_tensor(i);
+        if (current.get_element_type() == expected_type) {
+            continue;
+        }
+        infer_request.set_output_tensor(i, ov::Tensor(expected_type, current.get_shape()));
+    }
+
+    stage = "infer";
     infer_request.infer();
+
+    stage = "copy_outputs";
+    for (size_t i = 0; i < ov_result_names.size(); i++) {
+        const auto & result_name = ov_result_names[i];
+
+        const auto & outputs = decoder->get_model_outputs();
+        auto it = outputs.find(result_name);
+        if (it == outputs.end()) {
+            GGML_LOG_ERROR("GGML OpenVINO Backend: output '%s' not found; available outputs: ", result_name.c_str());
+            for (const auto & kv : outputs) {
+                GGML_LOG_ERROR("%s ", kv.first.c_str());
+            }
+            GGML_LOG_ERROR("\n");
+            throw std::out_of_range("missing model output " + result_name);
+        }
+
+        copy_ov_tensor_to_ggml(infer_request.get_output_tensor(i), it->second, result_name);
+    }
     return GGML_STATUS_SUCCESS;
+    } catch (const std::exception & e) {
+        const auto key = compute_graph_key(cgraph);
+        GGML_LOG_ERROR("GGML OpenVINO Backend: naive compute exception (device=%s stage=%s n_nodes=%d first=%s last=%s): %s\n",
+                       device.c_str(), stage, cgraph->n_nodes, key.first_node_name.c_str(), key.last_node_name.c_str(),
+                       e.what());
+    } catch (...) {
+        const auto key = compute_graph_key(cgraph);
+        GGML_LOG_ERROR("GGML OpenVINO Backend: naive compute unknown exception (device=%s stage=%s n_nodes=%d first=%s last=%s)\n",
+                       device.c_str(), stage, cgraph->n_nodes, key.first_node_name.c_str(), key.last_node_name.c_str());
+    }
+    return GGML_STATUS_FAILED;
 }
 
 namespace {

@@ -170,6 +170,7 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph, std::map<std::string, std::sh
                 param_node->set_friendly_name(src_name);
                 param_node->output(0).get_tensor().set_names({src_name});
                 m_model_inputs[src_name] = param_node;
+                m_inputs[src_name] = src_node;
             }
         }
         output_name_set.emplace(node_info.node_output_name);
@@ -364,15 +365,27 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
         std::string name = std::string(node->name);
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
             auto * cache_k_perm = node->src[1];
-            assert(cache_k_perm->op == GGML_OP_PERMUTE);
+            if (cache_k_perm == nullptr || cache_k_perm->op != GGML_OP_PERMUTE) {
+                continue;
+            }
+
             auto * cache_k_view = cache_k_perm->src[0];
-            assert(cache_k_view->op == GGML_OP_VIEW);
+            if (cache_k_view == nullptr || cache_k_view->op != GGML_OP_VIEW) {
+                continue;
+            }
 
             auto * cache_k = cache_k_view->src[0];
-            int layer = extract_layer_from_name(cache_k->name);
             auto * mask = node->src[3];
+            if (cache_k == nullptr || mask == nullptr) {
+                continue;
+            }
+
             std::string mask_name(mask->name);
-            assert(mask_name.find("KQ_mask") == 0);
+            if (mask_name.find("KQ_mask") != 0) {
+                continue;
+            }
+
+            int layer = extract_layer_from_name(cache_k->name);
 
             if (std::string(node->src[3]->name).find("swa") != std::string::npos) {
                 model_params.swa_layers.push_back(layer);
@@ -383,10 +396,14 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             }
 
             compute_params.n_seq_active = mask->ne[3];
-            auto seq_size = cache_k->ne[0] * cache_k->ne[1] * ggml_type_size(cache_k->type);
+            const size_t seq_size = cache_k->ne[0] > 0 && cache_k->ne[1] > 0 ?
+                (size_t) cache_k->ne[0] * (size_t) cache_k->ne[1] * ggml_type_size(cache_k->type) :
+                0;
             size_t offset;
             memcpy(&offset, cache_k_view->op_params, sizeof(size_t));
-            compute_params.seq_active_start = offset / seq_size;
+            if (seq_size > 0) {
+                compute_params.seq_active_start = offset / seq_size;
+            }
             compute_params.token_len_per_seq = node->ne[2];
 
             if (mask_name.find("swa") != std::string::npos) {
@@ -401,16 +418,30 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             }
 
         } else if (node->op == GGML_OP_ROPE) {
-            if (name.find("Qcur-0") == 0 || std::string(node->src[0]->name).find("Qcur-0") == 0) {
+            auto * src0 = node->src[0];
+            if (src0 == nullptr) {
+                continue;
+            }
+            const std::string src0_name(src0->name);
+
+            auto * inp_pos = node->src[1];
+            if (inp_pos != nullptr) {
+                compute_params.input_len = inp_pos->ne[0];
+            }
+
+            // The ROPE params are the same across layers. Some backend-scheduled subgraphs do not include layer 0,
+            // so fall back to the first ROPE op we see.
+            if (model_params.rope_params == nullptr) {
+                model_params.rope_params = node->op_params;
+            }
+
+            if (name.find("Qcur") == 0 || src0_name.find("Qcur") == 0) {
                 model_params.head_size = node->ne[0];
                 model_params.n_heads = node->ne[1];
-                model_params.rope_params = node->op_params;
-                auto * inp_pos = node->src[1];
-                compute_params.input_len = inp_pos->ne[0];
-            } else if (name.find("Kcur-0") == 0 || std::string(node->src[0]->name).find("Kcur-0") == 0) {
+            } else if (name.find("Kcur") == 0 || src0_name.find("Kcur") == 0) {
                 model_params.n_heads_kv = node->ne[1];
             }
-        } else if (node->op == GGML_OP_GET_ROWS && std::string(node->src[1]->name) == "inp_out_ids") {
+        } else if (node->op == GGML_OP_GET_ROWS && node->src[1] != nullptr && std::string(node->src[1]->name) == "inp_out_ids") {
             // for static case, output_len is always 1 except for llama-perplexity
             compute_params.output_len = node->src[1]->ne[0];
             if (is_static && compute_params.output_len == 0) {
@@ -418,8 +449,13 @@ std::pair<ModelParams, ComputeParams> GgmlOvDecoder::compute_llm_params(ggml_cgr
             }
         }
     }
-    model_params.ctx = model_params.ctx_per_seq * model_params.n_seq;
-    model_params.ctx_swa = model_params.ctx_per_seq_swa * model_params.n_seq;
+
+    if (model_params.ctx_per_seq > 0 && model_params.n_seq > 0) {
+        model_params.ctx = model_params.ctx_per_seq * model_params.n_seq;
+    }
+    if (model_params.ctx_per_seq_swa > 0 && model_params.n_seq > 0) {
+        model_params.ctx_swa = model_params.ctx_per_seq_swa * model_params.n_seq;
+    }
     return {model_params, compute_params};
 }
 

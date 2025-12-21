@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -15,7 +17,46 @@
  */
 struct callback_data {
     std::vector<uint8_t> data;
+    std::vector<std::string> dump_prefixes;
 };
+
+static std::vector<std::string> get_dump_prefixes_from_env() {
+    const char * env = std::getenv("LLAMA_EVAL_CALLBACK_TENSOR_PREFIX");
+    if (!env || env[0] == '\0') {
+        return {};
+    }
+
+    auto parts = string_split<std::string>(env, ',');
+    std::vector<std::string> prefixes;
+    prefixes.reserve(parts.size());
+
+    for (auto & part : parts) {
+        part = string_strip(part);
+        if (!part.empty()) {
+            prefixes.push_back(part);
+        }
+    }
+
+    return prefixes;
+}
+
+static bool should_dump_tensor(const callback_data * cb_data, const ggml_tensor * t) {
+    if (cb_data->dump_prefixes.empty()) {
+        return true;
+    }
+
+    for (const auto & prefix : cb_data->dump_prefixes) {
+        const size_t n = prefix.size();
+        if (n == 0) {
+            continue;
+        }
+        if (std::strncmp(t->name, prefix.c_str(), n) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static std::string ggml_ne_string(const ggml_tensor * t) {
     std::string str;
@@ -128,7 +169,7 @@ static bool ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
     const struct ggml_tensor * src1 = t->src[1];
 
     if (ask) {
-        return true; // Always retrieve data
+        return should_dump_tensor(cb_data, t);
     }
 
     char src1_str[128] = {0};
@@ -183,6 +224,7 @@ static bool run(llama_context * ctx, const common_params & params) {
 
 int main(int argc, char ** argv) {
     callback_data cb_data;
+    cb_data.dump_prefixes = get_dump_prefixes_from_env();
 
     common_params params;
 
@@ -194,6 +236,10 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    if (!cb_data.dump_prefixes.empty()) {
+        LOG("eval-callback: LLAMA_EVAL_CALLBACK_TENSOR_PREFIX=%s\n", std::getenv("LLAMA_EVAL_CALLBACK_TENSOR_PREFIX"));
+    }
 
     // pass the callback to the backend scheduler
     // it will be executed for each node during the graph computation

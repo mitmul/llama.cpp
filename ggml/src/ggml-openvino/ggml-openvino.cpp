@@ -259,6 +259,30 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         }
         break;
     }
+    case GGML_OP_GET_ROWS: {
+        // Some Mamba state bookkeeping subgraphs mix attention + conv-state indexing and can trigger
+        // OpenVINO frontend crashes during conversion. Keep these on the CPU backend.
+        if (op->src[0] != nullptr && std::string(op->src[0]->name).find("mamba_conv1d_state") == 0) {
+            GGML_LOG_WARN("OpenVINO backend does not support GET_ROWS for mamba_conv1d_state\n");
+            return true;
+        }
+        break;
+    }
+    case GGML_OP_SCALE: {
+        if (std::string(op->name).find("mamba_conv1d_state") != std::string::npos) {
+            GGML_LOG_WARN("OpenVINO backend does not support SCALE for mamba_conv1d_state\n");
+            return true;
+        }
+        break;
+    }
+    case GGML_OP_RESHAPE:
+    case GGML_OP_VIEW: {
+        if (std::string(op->name).find("mamba_conv1d_state") != std::string::npos) {
+            GGML_LOG_WARN("OpenVINO backend does not support %s for mamba_conv1d_state\n", ggml_op_name(op->op));
+            return true;
+        }
+        break;
+    }
     case GGML_OP_MUL_MAT: {
         if (op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F16) {
             // Has accuracy issue, try enabling this and see `test-backend-ops -o "MUL_MAT"`
