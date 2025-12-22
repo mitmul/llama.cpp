@@ -1583,7 +1583,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
-            for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+            const bool is_openvino_backend = strcmp(ggml_backend_name(split_backend), "OPENVINO") == 0;
+
+            auto get_layer_id = [](const char * name) -> int {
+                if (name == NULL) {
+                    return -1;
+                }
+
+                const int len = (int) strlen(name);
+                if (len <= 0) {
+                    return -1;
+                }
+
+                int i = len - 1;
+                while (i >= 0 && name[i] >= '0' && name[i] <= '9') {
+                    --i;
+                }
+                if (i == len - 1) {
+                    return -1; // no trailing digits
+                }
+                if (i < 0) {
+                    return -1;
+                }
+                if (name[i] != '-' && name[i] != '.') {
+                    return -1;
+                }
+
+                int v = 0;
+                for (int j = i + 1; j < len; ++j) {
+                    v = v * 10 + (name[j] - '0');
+                }
+                return v;
+            };
+
+            for (int j0 = 0; j0 < split->graph.n_nodes; ) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
 
                 // check if the user needs data from this node
@@ -1597,21 +1630,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     need = sched->callback_eval(t, true, sched->callback_eval_user_data);
                 }
 
+                // OpenVINO (notably on Intel NPU) can produce incorrect results for very large graph views when
+                // intermediate tensors are only materialized implicitly. In eval-callback mode, we prefer correctness
+                // over maximum batching: cut views at "natural" boundaries so intermediate results are persisted and
+                // re-fed as inputs in the next view.
+                if (is_openvino_backend && j1 > j0) {
+                    int j_bound = j1;
+
+                    // 1) Always cut at SSM_CONV (Mamba conv1d) outputs.
+                    for (int k = j0; k <= j_bound; ++k) {
+                        if (split->graph.nodes[k]->op == GGML_OP_SSM_CONV) {
+                            j_bound = k;
+                            break;
+                        }
+                    }
+
+                    // 2) Avoid spanning multiple layers in a single view (best-effort via name suffix).
+                    int prev_layer = get_layer_id(split->graph.nodes[j0]->name);
+                    for (int k = j0 + 1; k <= j_bound; ++k) {
+                        const int cur_layer = get_layer_id(split->graph.nodes[k]->name);
+                        if (prev_layer >= 0 && cur_layer >= 0 && cur_layer != prev_layer) {
+                            j_bound = k - 1;
+                            break;
+                        }
+                        if (cur_layer >= 0) {
+                            prev_layer = cur_layer;
+                        }
+                    }
+
+                    if (j_bound < j1) {
+                        j1 = j_bound;
+                        t = split->graph.nodes[j1];
+                        need = false;
+                    }
+                }
+
+                // Some backends compute an entire subgraph at once and only materialize "outputs".
+                // When running with an eval callback, we compute the split graph in contiguous views
+                // [j0, j1] so the user can inspect intermediate tensors. For correctness, any tensor
+                // produced inside this view and referenced by later nodes (j > j1) must be
+                // materialized as well, otherwise later views can observe stale data.
+                //
+                // Mark these "live-out" tensors (and the requested tensor) as outputs temporarily so
+                // backends can preserve/copy them.
+                struct ggml_tensor ** marked_outputs = NULL;
+                int marked_outputs_cap = 0;
+                int marked_outputs_n = 0;
+
+                #define GGML_SCHED_PUSH_MARKED(_t) do { \
+                    if (marked_outputs_n == marked_outputs_cap) { \
+                        marked_outputs_cap = marked_outputs_cap ? marked_outputs_cap * 2 : 16; \
+                        marked_outputs = (struct ggml_tensor **) realloc(marked_outputs, marked_outputs_cap * sizeof(*marked_outputs)); \
+                        GGML_ASSERT(marked_outputs != NULL); \
+                    } \
+                    marked_outputs[marked_outputs_n++] = (_t); \
+                } while (0)
+
+                 auto mark_output_temp = [&](struct ggml_tensor * tensor) {
+                     if (tensor == NULL) {
+                         return;
+                     }
+                     if ((tensor->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+                         ggml_set_output(tensor);
+                         GGML_SCHED_PUSH_MARKED(tensor);
+                     }
+                 };
+
+                if (need) {
+                    // The requested tensor must be an output so backends can materialize it.
+                    mark_output_temp(t);
+                }
+
+                if (j1 < split->graph.n_nodes - 1) {
+                    const int n_range = j1 - j0 + 1;
+                    struct ggml_hash_set produced = ggml_hash_set_new((size_t) n_range * 2 + 1);
+
+                    for (int k = j0; k <= j1; ++k) {
+                        ggml_hash_insert(&produced, split->graph.nodes[k]);
+                    }
+
+                    for (int k = j1 + 1; k < split->graph.n_nodes; ++k) {
+                        struct ggml_tensor * node = split->graph.nodes[k];
+                        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                            struct ggml_tensor * src = node->src[s];
+                            if (src == NULL) {
+                                continue;
+                            }
+
+                            struct ggml_tensor * cur = src;
+                            while (cur != NULL) {
+                                if (ggml_hash_contains(&produced, cur)) {
+                                    mark_output_temp(cur);
+                                }
+                                cur = cur->view_src;
+                            }
+                        }
+                    }
+
+                    ggml_hash_set_free(&produced);
+                }
+
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    for (int mi = 0; mi < marked_outputs_n; ++mi) {
+                        marked_outputs[mi]->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                    }
+                    free(marked_outputs);
+                    #undef GGML_SCHED_PUSH_MARKED
                     return ec;
                 }
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 ggml_backend_synchronize(split_backend);
 
-                if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                bool keep_going = true;
+                if (need) {
+                    keep_going = sched->callback_eval(t, false, sched->callback_eval_user_data);
+                }
+
+                for (int mi = 0; mi < marked_outputs_n; ++mi) {
+                    marked_outputs[mi]->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                }
+                free(marked_outputs);
+                #undef GGML_SCHED_PUSH_MARKED
+
+                if (need && !keep_going) {
                     break;
                 }
 
-                j0 = j1;
+                j0 = j1 + 1;
             }
         }
 

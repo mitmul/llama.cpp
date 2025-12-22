@@ -32,16 +32,6 @@ struct ggml_backend_openvino_context {
     std::string name;         // context Name
     std::string description;  // context description
 
-    // OpenVINO core components
-    ov::Core core;                             // OpenVINO core interface
-    std::shared_ptr<ov::CompiledModel> model;  // compiled Model
-    ov::InferRequest infer_request;            // inference Request
-
-    // OpenVINO Multi-stream support
-    static const int MAX_STREAMS = 8;       // define the maximum number of flows
-    std::vector<ov::InferRequest> streams;  // used to support multi-stream reasoning
-    int current_stream;                     // the currently active stream index
-
     // state Management
     bool is_initialized;  // initialize
 
@@ -49,7 +39,6 @@ struct ggml_backend_openvino_context {
         device(0),
         name("OpenVINO"),
         description("OpenVINO Backend Context"),
-        current_stream(0),
         is_initialized(false) {}
 };
 

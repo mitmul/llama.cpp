@@ -3,6 +3,8 @@
 #include "../utils.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <openvino/core/node.hpp>
 #include <openvino/core/node_output.hpp>
@@ -45,7 +47,36 @@ OutputVector translate_rope(const NodeContext & context) {
         if (context.get_input_size() == 3) {
             rope_freqs_weight = context.get_input(2).get_node_shared_ptr();
         }
-        auto sin_cos = make_sin_cos(op_params, inp_pos, rope_freqs_weight);
+        // ggml encodes ROPE params as int32_t[], but some models pass n_dims=0 to mean "use full head size".
+        // Our sin/cos generator needs an explicit n_dims, so infer it from the tensor shape when needed.
+        int32_t params_local[15];
+        std::memcpy(params_local, op_params, sizeof(params_local));
+        const int32_t inferred_dims = static_cast<int32_t>(output_shape.empty() ? 0 : output_shape.back());
+        if (params_local[1] <= 0) {
+            params_local[1] = inferred_dims;
+        }
+        if (const char * trace = std::getenv("GGML_OPENVINO_TRACE_ROPE"); trace && std::strcmp(trace, "0") != 0) {
+            float freq_base;
+            float freq_scale;
+            float ext_factor;
+            float attn_factor;
+            float beta_fast;
+            float beta_slow;
+            std::memcpy(&freq_base, params_local + 5, sizeof(float));
+            std::memcpy(&freq_scale, params_local + 6, sizeof(float));
+            std::memcpy(&ext_factor, params_local + 7, sizeof(float));
+            std::memcpy(&attn_factor, params_local + 8, sizeof(float));
+            std::memcpy(&beta_fast, params_local + 9, sizeof(float));
+            std::memcpy(&beta_slow, params_local + 10, sizeof(float));
+            GGML_LOG_INFO(
+                "GGML OpenVINO Backend: ROPE name=%s op_case=%d n_dims=%d inferred=%d mode=%d n_ctx_orig=%d freq_base=%g freq_scale=%g ext_factor=%g attn_factor=%g beta_fast=%g beta_slow=%g out_shape=[%zu,%zu,%zu,%zu]\n",
+                context.get_name().c_str(), op_case, params_local[1], inferred_dims, params_local[2], params_local[4],
+                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+                output_shape.size() > 0 ? output_shape[0] : 0, output_shape.size() > 1 ? output_shape[1] : 0,
+                output_shape.size() > 2 ? output_shape[2] : 0, output_shape.size() > 3 ? output_shape[3] : 0);
+        }
+
+        auto sin_cos = make_sin_cos(params_local, inp_pos, rope_freqs_weight);
         sin_theta_node = sin_cos.first;
         cos_theta_node = sin_cos.second;
     }

@@ -24,7 +24,8 @@ OutputVector translate_rms_norm(const NodeContext & context) {
         input_node, ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {2.0f}));
 
     auto mean = std::make_shared<ov::op::v1::ReduceMean>(
-        square, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-1}), true);
+        // Use an explicit last-axis index. Some plugins have been observed to mishandle negative axes.
+        square, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {3}), true);
 
     float eps;
     memcpy(&eps, context.get_output_op_params(), sizeof(float));

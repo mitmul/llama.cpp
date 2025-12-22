@@ -23,6 +23,7 @@ llm_build_plamo2::llm_build_plamo2(const llama_model & model, const llm_graph_pa
 
         // pre_mixer_norm
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+        cb(cur, "attn_pre_norm", il);
 
         // check if this layer is Mamba or Attention
         bool is_mamba_layer = hparams.is_recurrent(il);

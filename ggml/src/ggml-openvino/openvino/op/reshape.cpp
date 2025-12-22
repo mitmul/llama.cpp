@@ -39,9 +39,10 @@ OutputVector translate_reshape(const NodeContext & context) {
             std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, (int64_t) output_shape[3]});
 
     } else if (op_case == 3) {
-        throw std::runtime_error("might be outdated RESHAPE case");
-        new_shape_node = ov::op::v0::Constant::create(
-            ov::element::i64, {4}, std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, 1});
+        // Historically this case used a hard-coded {out0, out1, -1, 1}. That can be incorrect for
+        // some backend-scheduled subgraphs (e.g. non-flash attention graphs) and caused conversion failures.
+        std::vector<int64_t> shape_vec(output_shape.begin(), output_shape.end());
+        new_shape_node = ov::op::v0::Constant::create(ov::element::i64, {shape_vec.size()}, shape_vec);
 
     } else if (op_case == 4) {
         return {context.get_input(0).get_node_shared_ptr()->input_value(0)};

@@ -142,6 +142,14 @@ void add_rope_sin_cos(TensorMap & tensor_map, GgmlDecoder & ggml_model_decoder) 
         GGML_LOG_WARN("GGML OpenVINO Backend: skipping rope sin/cos generation because rope params are missing\n");
         return;
     }
+    if (rope_params[1] <= 0) {
+        // Some models set n_dims=0 to mean "use full head size". The static preprocess path does not
+        // have enough context to infer head size safely, so defer sin/cos generation to the ROPE op
+        // translator which has access to the tensor shapes.
+        GGML_LOG_WARN("GGML OpenVINO Backend: skipping rope sin/cos generation because rope n_dims=%d is not static\n",
+                      rope_params[1]);
+        return;
+    }
     auto inp_pos = tensor_map_at(tensor_map, "inp_pos").get_node_shared_ptr();
     std::shared_ptr<ov::Node> rope_freqs_weight;
     if (tensor_map.find("rope_freqs.weight") != tensor_map.end()) {

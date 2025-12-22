@@ -18,6 +18,7 @@
 struct callback_data {
     std::vector<uint8_t> data;
     std::vector<std::string> dump_prefixes;
+    int64_t dump_n = 0;
 };
 
 static std::vector<std::string> get_dump_prefixes_from_env() {
@@ -50,12 +51,40 @@ static bool should_dump_tensor(const callback_data * cb_data, const ggml_tensor 
         if (n == 0) {
             continue;
         }
+        // Suffix '$' means exact match (handy to avoid 'ffn_residual-1' matching 'ffn_residual-10').
+        if (prefix.back() == '$') {
+            const std::string exact = prefix.substr(0, n - 1);
+            if (!exact.empty() && std::strcmp(t->name, exact.c_str()) == 0) {
+                return true;
+            }
+            continue;
+        }
+
         if (std::strncmp(t->name, prefix.c_str(), n) == 0) {
             return true;
         }
     }
 
     return false;
+}
+
+static int64_t get_dump_n_from_env() {
+    const char * env = std::getenv("LLAMA_EVAL_CALLBACK_DUMP_N");
+    if (!env || env[0] == '\0') {
+        // The user requested "GGML_MAX_DIMS=256"; interpret it as "dump first N values"
+        // for this example (not the compile-time ggml tensor rank limit).
+        env = std::getenv("GGML_MAX_DIMS");
+    }
+    if (!env || env[0] == '\0') {
+        return 0;
+    }
+
+    char * end = nullptr;
+    const long long v = std::strtoll(env, &end, 10);
+    if (end == env || v <= 0) {
+        return 0;
+    }
+    return (int64_t) v;
 }
 
 static std::string ggml_ne_string(const ggml_tensor * t) {
@@ -101,51 +130,44 @@ static float ggml_get_float_value(const uint8_t * data, ggml_type type, const si
     return v;
 }
 
-static void ggml_print_tensor(uint8_t * data, ggml_type type, const int64_t * ne, const size_t * nb, int64_t n) {
-    GGML_ASSERT(n > 0);
-    float sum = 0;
-    for (int64_t i3 = 0; i3 < ne[3]; i3++) {
-        for (int64_t i2 = 0; i2 < ne[2]; i2++) {
-            for (int64_t i1 = 0; i1 < ne[1]; i1++) {
-                for (int64_t i0 = 0; i0 < ne[0]; i0++) {
-                    const float v = ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
-                    sum += v;
-                }
-            }
-        }
-    }
-    for (int64_t i3 = 0; i3 < ne[3]; i3++) {
-        LOG("                                     [\n");
-        for (int64_t i2 = 0; i2 < ne[2]; i2++) {
-            if (i2 == n && ne[2] > 2*n) {
-                LOG("                                      ..., \n");
-                i2 = ne[2] - n;
-            }
-            LOG("                                      [\n");
-            for (int64_t i1 = 0; i1 < ne[1]; i1++) {
-                if (i1 == n && ne[1] > 2*n) {
-                    LOG("                                       ..., \n");
-                    i1 = ne[1] - n;
-                }
-                LOG("                                       [");
-                for (int64_t i0 = 0; i0 < ne[0]; i0++) {
-                    if (i0 == n && ne[0] > 2*n) {
-                        LOG("..., ");
-                        i0 = ne[0] - n;
-                    }
-                    const float v = ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
-                    LOG("%12.4f", v);
-                    if (i0 < ne[0] - 1) LOG(", ");
-                }
-                LOG("],\n");
-            }
-            LOG("                                      ],\n");
-        }
-        LOG("                                     ]\n");
-        LOG("                                     sum = %f\n", sum);
+static void ggml_dump_tensor_first_n(const ggml_tensor * t,
+                                    uint8_t * data,
+                                    ggml_type type,
+                                    const int64_t * ne,
+                                    const size_t * nb,
+                                    int64_t dump_n) {
+    int64_t total = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        total *= ne[i] > 0 ? ne[i] : 0;
     }
 
-    // TODO: make this abort configurable/optional?
+    float sum = 0.0f;
+    for (int64_t i3 = 0; i3 < ne[3]; i3++) {
+        for (int64_t i2 = 0; i2 < ne[2]; i2++) {
+            for (int64_t i1 = 0; i1 < ne[1]; i1++) {
+                for (int64_t i0 = 0; i0 < ne[0]; i0++) {
+                    sum += ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
+                }
+            }
+        }
+    }
+
+    const int64_t take = dump_n > 0 ? std::min(dump_n, total) : 0;
+    LOG("EVALCB %s type=%s shape={%s} sum=%.9g first_n=%lld total=%lld\n",
+        t->name, ggml_type_name(type), ggml_ne_string(t).c_str(), sum, (long long) take, (long long) total);
+
+    LOG("EVALCB_VALS %s", t->name);
+    for (int64_t idx = 0; idx < take; ++idx) {
+        int64_t tmp = idx;
+        const int64_t i0 = ne[0] > 0 ? (tmp % ne[0]) : 0; tmp = ne[0] > 0 ? (tmp / ne[0]) : 0;
+        const int64_t i1 = ne[1] > 0 ? (tmp % ne[1]) : 0; tmp = ne[1] > 0 ? (tmp / ne[1]) : 0;
+        const int64_t i2 = ne[2] > 0 ? (tmp % ne[2]) : 0; tmp = ne[2] > 0 ? (tmp / ne[2]) : 0;
+        const int64_t i3 = tmp;
+        const float v = ggml_get_float_value(data, type, nb, i0, i1, i2, i3);
+        LOG(" %.9g", v);
+    }
+    LOG("\n");
+
     if (std::isnan(sum)) {
         LOG_ERR("encountered NaN - aborting\n");
         exit(0);
@@ -195,7 +217,11 @@ static bool ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type)) {
         uint8_t * data = is_host ? (uint8_t *) t->data : cb_data->data.data();
-        ggml_print_tensor(data, t->type, t->ne, t->nb, 3);
+        if (cb_data->dump_n > 0) {
+            ggml_dump_tensor_first_n(t, data, t->type, t->ne, t->nb, cb_data->dump_n);
+        } else {
+            ggml_dump_tensor_first_n(t, data, t->type, t->ne, t->nb, 3);
+        }
     }
 
     return true;
@@ -225,6 +251,7 @@ static bool run(llama_context * ctx, const common_params & params) {
 int main(int argc, char ** argv) {
     callback_data cb_data;
     cb_data.dump_prefixes = get_dump_prefixes_from_env();
+    cb_data.dump_n = get_dump_n_from_env();
 
     common_params params;
 
@@ -239,6 +266,9 @@ int main(int argc, char ** argv) {
 
     if (!cb_data.dump_prefixes.empty()) {
         LOG("eval-callback: LLAMA_EVAL_CALLBACK_TENSOR_PREFIX=%s\n", std::getenv("LLAMA_EVAL_CALLBACK_TENSOR_PREFIX"));
+    }
+    if (cb_data.dump_n > 0) {
+        LOG("eval-callback: dumping first %lld values per tensor\n", (long long) cb_data.dump_n);
     }
 
     // pass the callback to the backend scheduler

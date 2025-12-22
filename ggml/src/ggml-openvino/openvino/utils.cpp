@@ -17,6 +17,7 @@
 #include <openvino/op/sin.hpp>
 #include <openvino/op/subtract.hpp>
 #include <openvino/op/transpose.hpp>
+#include <stdexcept>
 #include <string>
 
 namespace ov {
@@ -126,6 +127,9 @@ std::pair<ov::Output<Node>, ov::Output<Node>> make_sin_cos(int32_t * rope_params
     float beta_fast;
     float beta_slow;
     const int n_dims = rope_params[1];
+    if (n_dims <= 0 || (n_dims % 2) != 0) {
+        throw std::runtime_error("OpenVINO ROPE: invalid n_dims=" + std::to_string(n_dims));
+    }
     const int n_ctx_orig = rope_params[4];
     memcpy(&freq_base, rope_params + 5, sizeof(float));
     memcpy(&freq_scale, rope_params + 6, sizeof(float));

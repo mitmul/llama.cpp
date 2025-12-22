@@ -31,6 +31,7 @@
 #include <optional>
 #include <ostream>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <stdexcept>
 #include <string>
@@ -74,6 +75,57 @@ const GgmlOvDecoder::NodeInfo & get_node_info_checked(
         throw std::out_of_range(oss.str());
     }
     return nodes[node_idx];
+}
+
+std::vector<std::string> split_env_prefixes(const char * env_name) {
+    const char * env = std::getenv(env_name);
+    if (env == nullptr || env[0] == '\0') {
+        return {};
+    }
+
+    std::vector<std::string> prefixes;
+    std::string current;
+    for (const char * p = env; ; ++p) {
+        const char c = *p;
+        if (c == ',' || c == '\0') {
+            auto start = current.find_first_not_of(" \t\r\n");
+            auto end = current.find_last_not_of(" \t\r\n");
+            if (start != std::string::npos && end != std::string::npos && end >= start) {
+                prefixes.push_back(current.substr(start, end - start + 1));
+            }
+            current.clear();
+            if (c == '\0') {
+                break;
+            }
+        } else {
+            current.push_back(c);
+        }
+    }
+
+    return prefixes;
+}
+
+bool matches_any_prefix(const std::vector<std::string> & prefixes, const std::string & name) {
+    for (const auto & prefix : prefixes) {
+        if (prefix.empty()) {
+            continue;
+        }
+
+        // Convenience: support eval-callback exact-match suffix '$' when using LLAMA_EVAL_CALLBACK_TENSOR_PREFIX
+        // as a forced output list.
+        if (prefix.back() == '$') {
+            const std::string exact = prefix.substr(0, prefix.size() - 1);
+            if (!exact.empty() && name == exact) {
+                return true;
+            }
+            continue;
+        }
+
+        if (name.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -135,6 +187,61 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
         }
     }
 
+    // Backend-scheduled subgraphs and eval-callback graph views do not always have GGML_TENSOR_FLAG_OUTPUT set on their
+    // internal "boundary" tensors. If we miss such boundary tensors, downstream backends (or eval callbacks) can observe
+    // stale/zero values because OpenVINO only materializes Model Results. Some plugins (notably Intel NPU) can also crash
+    // when compiling a Model with zero Results.
+    //
+    // Ensure every subgraph has (at least) its sink nodes as model outputs, in addition to any explicitly marked outputs.
+    if (!m_node_info_list.empty()) {
+        std::unordered_set<std::string> used_outputs;
+        used_outputs.reserve(m_node_info_list.size());
+        size_t added = 0;
+
+        for (auto it = m_node_info_list.rbegin(); it != m_node_info_list.rend(); ++it) {
+            const auto & node_info = *it;
+            const bool is_sink = used_outputs.count(node_info.node_output_name) == 0;
+            if (is_sink) {
+                if (node_info.node_output != nullptr &&
+                    m_model_outputs.find(node_info.node_output_name) == m_model_outputs.end()) {
+                    m_model_outputs[node_info.node_output_name] = node_info.node_output;
+                    ++added;
+                }
+            }
+
+            for (const auto & kv : node_info.node_inputs) {
+                if (produced_names.count(kv.first)) {
+                    used_outputs.insert(kv.first);
+                }
+            }
+        }
+
+        if (m_model_outputs.empty()) {
+            const auto & last = m_node_info_list.back();
+            if (last.node_output != nullptr) {
+                m_model_outputs[last.node_output_name] = last.node_output;
+                ++added;
+            }
+        }
+
+        if (added > 0) {
+            if (const char * trace = getenv("GGML_OPENVINO_TRACE_OUTPUTS"); trace && std::string(trace) != "0") {
+                std::ostringstream oss;
+                oss << "GGML OpenVINO Backend: inferred " << added << " sink outputs: ";
+                bool first = true;
+                for (const auto & kv : m_model_outputs) {
+                    if (!first) {
+                        oss << ", ";
+                    }
+                    oss << kv.first;
+                    first = false;
+                }
+                oss << "\n";
+                GGML_LOG_INFO("%s", oss.str().c_str());
+            }
+        }
+    }
+
     add_extra_inputs();
 }
 
@@ -177,10 +284,12 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph, std::map<std::string, std::sh
         data_addr_map[node_info.data_addr] = node_info.node_output;
     }
     for (const auto & it : data_addr_map) {
-        // No need to add view tensors as model outputs
-        if (it.second->op != GGML_OP_VIEW) {
-            m_model_outputs[std::string(it.second->name)] = it.second;
-        }
+        // Include view tensors as outputs in the naive decoder.
+        //
+        // Backend-scheduled graph views (e.g. llama-eval-callback dumps) can end a tiny OpenVINO subgraph on a VIEW
+        // node. If we drop VIEW outputs here, the last non-VIEW producer for the same data address is effectively
+        // masked and the buffer is never materialized, so downstream CPU/OpenVINO chunks can observe stale data.
+        m_model_outputs[std::string(it.second->name)] = it.second;
     }
 }
 
@@ -247,9 +356,23 @@ void GgmlOvDecoder::set_input_output(ggml_tensor * node, bool naive) {
     if (!naive) {
         // Model outputs are tensors with GGML_TENSOR_FLAG_OUTPUT flag and kv_caches
         static std::set<std::string> debug_output_names = {};
+        static const std::vector<std::string> forced_output_prefixes = [] {
+            auto prefixes = split_env_prefixes("GGML_OPENVINO_FORCE_OUTPUT_PREFIX");
+            if (prefixes.empty()) {
+                // Convenience for llama-eval-callback: allow forcing outputs via the same prefix filter.
+                const auto cb_prefixes = split_env_prefixes("LLAMA_EVAL_CALLBACK_TENSOR_PREFIX");
+                prefixes.insert(prefixes.end(), cb_prefixes.begin(), cb_prefixes.end());
+            }
+            return prefixes;
+        }();
+
+        const bool is_forced_output =
+            matches_any_prefix(forced_output_prefixes, node_output_name) ||
+            matches_any_prefix(forced_output_prefixes, node_name);
         // Workaround: the final tensor "result_output" does not have GGML_TENSOR_FLAG_OUTPUT flag set in cgraph
         if (node->op == GGML_OP_SET_ROWS || node->flags & GGML_TENSOR_FLAG_OUTPUT ||
-            node_output_name.find("output") != std::string::npos || debug_output_names.count(node_output_name)) {
+            node_output_name.find("output") != std::string::npos || debug_output_names.count(node_output_name) ||
+            is_forced_output) {
             if (m_model_outputs.find(node_output_name) == m_model_outputs.end()) {
                 m_model_outputs[node_output_name] = node_output;
             }
@@ -491,8 +614,22 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
         }
 
     } else if (op && op->op == GGML_OP_SET_ROWS && op->src[1] == input) {
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
-        input_shape = ov::PartialShape{1, 1, 1, len};
+        // SET_ROWS indices usually correspond to token positions (len == token_len), but some graphs use
+        // a fixed-size indices vector (e.g., flattened KV cache updates with head_size elements).
+        // Only force token_len for the token-position case; otherwise keep the original ggml shape.
+        if (!m_is_static) {
+            input_shape = ov::PartialShape{get_shape(input)};
+        } else {
+            const int token_len = m_is_prefill ? m_prefill_chunk_size : 1;
+            const ggml_tensor * updates = op->src[0];
+            const int64_t updates_rows = updates ? updates->ne[1] : -1;
+
+            if (updates_rows == token_len) {
+                input_shape = ov::PartialShape{1, 1, 1, token_len};
+            } else {
+                input_shape = ov::PartialShape{get_shape(input)};
+            }
+        }
 
     } else {
         input_shape = ov::PartialShape{get_shape(input)};
@@ -641,8 +778,21 @@ std::shared_ptr<ov::Node> GgmlOvDecoder::create_weight_node(ggml_tensor * tensor
     OPENVINO_ASSERT(node_shape[0] == 1, "Got 3D weights, expect all weights to be 2D: ", tensor->name);
     node_shape.erase(node_shape.begin());
 
-    // F16 and F32 case
+    // F16/F32/BF16 case
     if (node_type != ov::element::dynamic) {
+        // Optional requantization for NPU stability/compat: allow converting BF16 weights to FP16.
+        if (requant_type.has_value() && requant_type.value() == ExtraQuantType::F16 && tensor->type == GGML_TYPE_BF16) {
+            ov::Tensor weights(ov::element::f16, node_shape);
+            const auto * src = (const ggml_bf16_t *) tensor->data;
+            auto * dst = weights.data<ov::float16>();
+            for (size_t i = 0; i < (size_t) ne_total; ++i) {
+                dst[i] = ov::float16(ggml_bf16_to_fp32(src[i]));
+            }
+            std::shared_ptr<ov::Node> weight_node = std::make_shared<ov::op::v0::Constant>(weights);
+            weight_node->set_friendly_name(tensor->name);
+            return weight_node;
+        }
+
         ov::Tensor weights(node_type, node_shape);
         memcpy(weights.data(), tensor->data, ne_total * node_type.size());
         std::shared_ptr<ov::Node> weight_node = std::make_shared<ov::op::v0::Constant>(weights);

@@ -42,69 +42,68 @@ OutputVector translate_ssm_conv(const NodeContext & context) {
     auto sx = context.get_input(0);
     auto c = context.get_input(1);
 
-    auto sx_shape = context.get_input_shape(0);
-    auto c_shape = context.get_input_shape(1);
-    FRONT_END_GENERAL_CHECK(sx_shape.is_static() && c_shape.is_static(), "SSM_CONV requires static shapes");
+    auto sx_shape_ps = context.get_input_shape(0);
+    auto c_shape_ps = context.get_input_shape(1);
+    FRONT_END_GENERAL_CHECK(sx_shape_ps.is_static() && c_shape_ps.is_static(), "SSM_CONV requires static shapes");
 
-    auto sx_shape_vec = sx_shape.to_shape();
-    auto c_shape_vec = c_shape.to_shape();
+    auto sx_shape = sx_shape_ps.to_shape();
+    auto c_shape = c_shape_ps.to_shape();
 
-    auto to_ggml_shape = [](const std::vector<size_t> & shape) {
-        return std::vector<int64_t>(shape.rbegin(), shape.rend());
-    };
-    auto trim_trailing_ones = [](std::vector<int64_t> & shape, size_t target_rank) {
-        while (shape.size() > target_rank && !shape.empty() && shape.back() == 1) {
-            shape.pop_back();
+    // The ggml frontend uses 4D shapes in OpenVINO order: [ne3, ne2, ne1, ne0].
+    // For SSM_CONV:
+    // - sx ggml shape is [time, d_inner, n_s] (3D), so OpenVINO sees [1, n_s, d_inner, time]
+    // - c  ggml shape is [d_conv, d_inner] (2D), so OpenVINO sees [1, 1, d_inner, d_conv]
+    auto normalize_rank = [](ov::Output<ov::Node> node, ov::Shape & shape, size_t target_rank) -> ov::Output<ov::Node> {
+        if (shape.size() == target_rank) {
+            return node;
         }
+        ov::Shape adjusted;
+        if (shape.size() > target_rank) {
+            adjusted.insert(adjusted.end(), shape.end() - static_cast<std::ptrdiff_t>(target_rank), shape.end());
+        } else {
+            adjusted.insert(adjusted.end(), target_rank - shape.size(), 1);
+            adjusted.insert(adjusted.end(), shape.begin(), shape.end());
+        }
+        shape = adjusted;
+        auto shape_const = ov::op::v0::Constant::create(
+            ov::element::i64, {shape.size()}, std::vector<int64_t>(shape.begin(), shape.end()));
+        return std::make_shared<ov::op::v1::Reshape>(node, shape_const, false);
     };
 
-    auto sx_shape_ggml = to_ggml_shape(sx_shape_vec);  // ggml order: [ne0, ne1, ...]
-    auto c_shape_ggml = to_ggml_shape(c_shape_vec);
-    trim_trailing_ones(sx_shape_ggml, 3);
-    trim_trailing_ones(c_shape_ggml, 2);
+    sx = normalize_rank(sx, sx_shape, 4);
+    // Weights are stored as 2D constants in the ggml OpenVINO decoder.
+    // For SSM_CONV weights, the decoder materializes them as [d_inner, d_conv] so that the last dim is the kernel.
+    c = normalize_rank(c, c_shape, 2);
 
-    FRONT_END_GENERAL_CHECK(sx_shape_ggml.size() == 3 && c_shape_ggml.size() == 2,
-                            "SSM_CONV expects 3D input and 2D kernel");
+    FRONT_END_GENERAL_CHECK(sx_shape[0] == 1, "SSM_CONV expects leading dim == 1");
 
-    if (sx_shape_vec.size() != sx_shape_ggml.size() ||
-        !std::equal(sx_shape_vec.rbegin(), sx_shape_vec.rbegin() + static_cast<long>(sx_shape_ggml.size()),
-                    sx_shape_ggml.begin())) {
-        auto target = ov::op::v0::Constant::create(
-            ov::element::i64, {sx_shape_ggml.size()}, std::vector<int64_t>(sx_shape_ggml.begin(), sx_shape_ggml.end()));
-        sx = std::make_shared<ov::op::v1::Reshape>(sx, target, false);
-    }
-    if (c_shape_vec.size() != c_shape_ggml.size() ||
-        !std::equal(c_shape_vec.rbegin(), c_shape_vec.rbegin() + static_cast<long>(c_shape_ggml.size()),
-                    c_shape_ggml.begin())) {
-        auto target = ov::op::v0::Constant::create(
-            ov::element::i64, {c_shape_ggml.size()}, std::vector<int64_t>(c_shape_ggml.begin(), c_shape_ggml.end()));
-        c = std::make_shared<ov::op::v1::Reshape>(c, target, false);
-    }
+    const int64_t n_s = static_cast<int64_t>(sx_shape[1]);
+    const int64_t d_inner = static_cast<int64_t>(sx_shape[2]);
+    const int64_t time = static_cast<int64_t>(sx_shape[3]);
 
-    const int64_t d_conv = static_cast<int64_t>(c_shape_ggml[0]);
-    const int64_t d_inner = static_cast<int64_t>(c_shape_ggml[1]);
-    const int64_t n_t = static_cast<int64_t>(sx_shape_ggml[0]) - d_conv + 1;
-    const int64_t n_s = static_cast<int64_t>(sx_shape_ggml[2]);
+    FRONT_END_GENERAL_CHECK(c_shape.size() == 2, "SSM_CONV kernel expects 2D weights");
+    const int64_t d_inner_w = static_cast<int64_t>(c_shape[0]);
+    const int64_t d_conv = static_cast<int64_t>(c_shape[1]);
 
-    FRONT_END_GENERAL_CHECK(sx_shape_ggml[1] == c_shape_ggml[1], "SSM_CONV channel size mismatch");
-    FRONT_END_GENERAL_CHECK(sx_shape_ggml[0] == static_cast<size_t>(d_conv - 1 + n_t),
-                            "SSM_CONV time dimension mismatch");
+    FRONT_END_GENERAL_CHECK(d_inner_w == d_inner, "SSM_CONV channel size mismatch");
+    const int64_t n_t = time - d_conv + 1;
+    FRONT_END_GENERAL_CHECK(n_t >= 0, "SSM_CONV time dimension mismatch");
 
-    // reorder input to [n_s, d_inner, time]
-    auto data_perm = make_const({3}, {2, 1, 0});
-    auto data_ncw = std::make_shared<ov::op::v1::Transpose>(sx, data_perm);
+    // Convert sx to 1D "NCW" layout expected by GroupConvolution: [n_s, d_inner, time].
+    // We cannot reshape into ggml dimension order (time-major) because it changes the meaning of the linear layout.
+    sx = std::make_shared<ov::op::v1::Reshape>(sx, make_const({3}, {n_s, d_inner, time}), false);
 
-    // weights: [d_conv, d_inner] -> [d_inner, 1, 1, d_conv] for depthwise group convolution
-    auto weights_t = std::make_shared<ov::op::v1::Transpose>(c, make_const({2}, {1, 0}));
-    auto weights_shape = make_const({4}, {d_inner, 1, 1, d_conv});
-    auto weights_dw = std::make_shared<ov::op::v1::Reshape>(weights_t, weights_shape, false);
+    // Depthwise weights for GroupConvolution: [groups=d_inner, OC/group=1, IC/group=1, d_conv].
+    // `c` is laid out as [d_inner, d_conv] where `c[g,k] = ggml_c[k,g]`, matching depthwise conv expectations.
+    auto weights_dw = std::make_shared<ov::op::v1::Reshape>(c, make_const({4}, {d_inner, 1, 1, d_conv}), false);
 
     auto conv = std::make_shared<ov::op::v1::GroupConvolution>(
-        data_ncw, weights_dw, ov::Strides{1}, ov::CoordinateDiff{0}, ov::CoordinateDiff{0}, ov::Strides{1});
+        sx, weights_dw, ov::Strides{1}, ov::CoordinateDiff{0}, ov::CoordinateDiff{0}, ov::Strides{1});
 
-    // back to layout expected by downstream ops: [n_s, n_t, d_inner]
-    auto out_perm = make_const({3}, {0, 2, 1});
+    // Convert output to ggml's OpenVINO shape: [1, n_s, n_t, d_inner] (reversed from ggml [d_inner, n_t, n_s]).
+    auto out_perm = make_const({3}, {0, 2, 1});  // [n_s, d_inner, n_t] -> [n_s, n_t, d_inner]
     ov::Output<ov::Node> result = std::make_shared<ov::op::v1::Transpose>(conv, out_perm);
+    result = std::make_shared<ov::op::v0::Unsqueeze>(result, make_const({1}, {0}));
 
     const auto output_shape = context.get_output_shape().to_shape();
     if (!output_shape.empty()) {

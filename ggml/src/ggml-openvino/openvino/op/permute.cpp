@@ -35,9 +35,16 @@ OutputVector translate_permute(const NodeContext & context) {
         auto output_shape = context.get_output_shape().to_shape();
         auto n_heads = ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[1]});
         auto head_size = ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[3]});
-        auto n_seq_active = context.has_input("n_seq_active") ?
-                                context.get_input("n_seq_active") :
-                                ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[0]});
+        ov::Output<ov::Node> n_seq_active =
+            context.has_input("n_seq_active") ?
+                context.get_input("n_seq_active") :
+                ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[0]});
+        if (auto c = std::dynamic_pointer_cast<ov::op::v0::Constant>(n_seq_active.get_node_shared_ptr())) {
+            const auto vals = c->cast_vector<int64_t>();
+            if (!vals.empty() && vals[0] < 0) {
+                n_seq_active = ov::op::v0::Constant::create(ov::element::i64, {1}, {output_shape[0]});
+            }
+        }
         auto neg_one = ov::op::v0::Constant::create(ov::element::i64, {1}, {-1});
 
         auto new_shape =
@@ -54,8 +61,29 @@ OutputVector translate_permute(const NodeContext & context) {
         auto output_shape = context.get_output_shape().to_shape();
         int64_t head_size = output_shape[3];
         int64_t n_heads = output_shape[1];
-        int64_t ctx_per_seq = cache_shape[2].is_static() ? cache_shape[2].get_length() : -1;
-        int64_t n_seq = cache_shape[1].get_length();
+
+        // Cache layouts observed in ggml graphs can differ:
+        // - [n_seq, ctx_per_seq, n_heads, head_size]  (common for cache views)
+        // - [1, n_seq, ctx_per_seq, head_size]        (older/alternate patterns)
+        // Choose the layout that matches the requested output batch (n_seq_active).
+        int64_t ctx_per_seq = -1;
+        int64_t n_seq = -1;
+        if (cache_shape.rank().is_static() && cache_shape.size() >= 4) {
+            const int64_t out_n_seq = static_cast<int64_t>(output_shape[0]);
+            if (cache_shape[0].is_static() && cache_shape[0].get_length() == out_n_seq) {
+                n_seq = cache_shape[0].get_length();
+                ctx_per_seq = cache_shape[1].is_static() ? cache_shape[1].get_length() : -1;
+            } else if (cache_shape[1].is_static() && cache_shape[1].get_length() == out_n_seq) {
+                n_seq = cache_shape[1].get_length();
+                ctx_per_seq = cache_shape[2].is_static() ? cache_shape[2].get_length() : -1;
+            } else {
+                n_seq = cache_shape[0].is_static() ? cache_shape[0].get_length() : out_n_seq;
+                ctx_per_seq = cache_shape[1].is_static() ? cache_shape[1].get_length() : -1;
+            }
+        }
+        if (n_seq < 0) {
+            n_seq = static_cast<int64_t>(output_shape[0]);
+        }
 
         Output<Node> attention_size;
         if (!context.has_input("attention_size")) {

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
 
 #include <openvino/op/constant.hpp>
 #include <openvino/op/reshape.hpp>
@@ -41,26 +42,36 @@ OutputVector translate_view(const NodeContext & context) {
         // Fall through to legacy handling.
     }
 
-    // Fast-path: VIEW that selects a 1D slice (offset/length) and then reshapes.
-    // This is used by Mamba SSM_SCAN outputs where `y` and `state` are concatenated.
+    // Fast-path: VIEW that selects a contiguous slice from the last dimension and then reshapes.
+    // This covers common cases like:
+    // - Q/K/V views into a fused WQKV projection for both decode (token_len=1) and prefill (token_len>1)
+    // - Mamba SSM_SCAN outputs where `y` and `state` are concatenated
     try {
         const auto input_shape = context.get_input_shape(0).to_shape();
         const auto output_shape = context.get_output_shape().to_shape();
         const auto * op_params = reinterpret_cast<const size_t *>(context.get_output_op_params());
 
         if (!input_shape.empty() && !output_shape.empty() && op_params != nullptr && input_shape.size() == 4 &&
-            input_shape[0] == 1 && input_shape[1] == 1 && input_shape[2] == 1) {
+            input_shape[0] == 1 && input_shape[1] == 1) {
             const auto input_elems =
                 std::accumulate(input_shape.begin(), input_shape.end(), size_t{1}, std::multiplies<size_t>());
             const auto output_elems =
                 std::accumulate(output_shape.begin(), output_shape.end(), size_t{1}, std::multiplies<size_t>());
 
             if (output_elems > 0 && output_elems < input_elems) {
+                const size_t token_len = input_shape[2];
+                if (token_len == 0 || (output_elems % token_len) != 0) {
+                    throw std::runtime_error("VIEW fast-path expects output_elems divisible by token_len");
+                }
+                const size_t slice_elems = output_elems / token_len;
+                if (slice_elems == 0) {
+                    throw std::runtime_error("VIEW fast-path produced empty slice");
+                }
                 auto strides = context.get_input_stride(0);
                 if (strides.size() >= 4 && strides[3] > 0) {
                     const int64_t axis_dim = static_cast<int64_t>(input_shape[3]);
                     const int64_t start = static_cast<int64_t>(op_params[0] / strides[3]);
-                    const int64_t end = start + static_cast<int64_t>(output_elems);
+                    const int64_t end = start + static_cast<int64_t>(slice_elems);
                     if (start >= 0 && end >= start && end <= axis_dim) {
                         auto begin = ov::op::v0::Constant::create(ov::element::i64, {1}, {start});
                         auto end_const = ov::op::v0::Constant::create(ov::element::i64, {1}, {end});
@@ -134,10 +145,10 @@ OutputVector translate_view(const NodeContext & context) {
     }
 
     if (context.get_op_case() == 2) {
-        auto dst_shape = context.get_output_shape().to_shape();
-        const auto slice_len = static_cast<int>(dst_shape[2] * dst_shape[3]);
-        return rename_outputs_with_suffix({process_view_input(context, 0, slice_len)},
-                                          context.get_name());
+        // VIEW-of-VIEW with the same element count: the upstream VIEW already accounts for any offset.
+        // Applying process_view_input() here would apply the input VIEW's offset a second time and can
+        // create empty slices (e.g. Vcur views into a fused WQKV projection).
+        return {context.get_input(0)};
     }
     return {context.get_input(0)};
 }
