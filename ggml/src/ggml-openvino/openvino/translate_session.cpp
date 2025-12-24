@@ -8,6 +8,7 @@
 #include "pass/squeeze_matmul.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -100,6 +101,12 @@ void add_sliced_mask(TensorMap & tensor_map, GgmlDecoder & ggml_model_decoder) {
 
 void add_rope_sin_cos(TensorMap & tensor_map, GgmlDecoder & ggml_model_decoder) {
     int32_t * rope_params = ggml_model_decoder.get_rope_params();
+    if (!rope_params || rope_params[1] == 0) {
+        return;
+    }
+    if (tensor_map.find("inp_pos") == tensor_map.end()) {
+        return;
+    }
     auto inp_pos = tensor_map.at("inp_pos").get_node_shared_ptr();
     std::shared_ptr<ov::Node> rope_freqs_weight;
     if (tensor_map.find("rope_freqs_weight") != tensor_map.end()) {
@@ -149,6 +156,11 @@ std::shared_ptr<Model> TranslateSession::translate_graph(const frontend::InputMo
     const auto & ggml_model = std::dynamic_pointer_cast<InputModel>(input_model);
     std::shared_ptr<GgmlDecoder> ggml_model_decoder = ggml_model->get_model_decoder();
 
+    const bool trace_enabled = [] {
+        const char * env = getenv("GGML_OPENVINO_TRACE");
+        return env && std::string(env) != "0";
+    }();
+
     for (const auto & it : ggml_model_decoder->get_model_inputs()) {
         params.push_back(std::dynamic_pointer_cast<ov::op::v0::Parameter>(it.second));
         (*tensor_map)[it.first] = it.second;
@@ -169,6 +181,13 @@ std::shared_ptr<Model> TranslateSession::translate_graph(const frontend::InputMo
         auto operation_type = decoder->get_op_type(node_idx);
         if (operation_type == "GGML_OP_NONE") {
             return;
+        }
+
+        if (trace_enabled) {
+            const auto & node_name = decoder->get_op_name(node_idx);
+            std::fprintf(stderr, "GGML OpenVINO TRACE: translate node=%d op=%s name='%s'\n",
+                         node_idx, operation_type.c_str(), node_name.c_str());
+            std::fflush(stderr);
         }
 
         ov::OutputVector converted_outputs;

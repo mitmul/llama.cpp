@@ -14,6 +14,7 @@
 #include <openvino/op/matmul.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/slice.hpp>
+#include <openvino/op/tile.hpp>
 #include <openvino/op/transpose.hpp>
 #include <openvino/op/unsqueeze.hpp>
 #include <openvino/op/util/op_types.hpp>
@@ -35,47 +36,105 @@ OutputVector translate_mulmat(const NodeContext & context) {
 
     bool transpose_b = true;
     if (op_case == 2) {
-        B = B.get_node_shared_ptr()->input_value(0);
-        transpose_b = false;
+        auto b_node = B.get_node_shared_ptr();
+        if (b_node && b_node->get_input_size() > 0) {
+            B = b_node->input_value(0);
+        }
     } else if (op_case == 3) {
         B = process_view_input(context, 0);
         A = process_view_input(context, 1);
     }
+
+    // Some MUL_MAT inputs are ggml VIEW tensors that only reshape (same elements) and are otherwise translated as no-ops.
+    // Materialize those shapes here so OpenVINO MatMul sees compatible dimensions (e.g., flattening [128,64] -> 8192).
+    auto materialize_reshape_only = [&](const ov::Output<ov::Node> & node, size_t input_index) -> ov::Output<ov::Node> {
+        const auto expected_ps = context.get_input_shape(input_index);
+        if (!expected_ps.is_static()) {
+            return node;
+        }
+        const auto actual_ps = node.get_partial_shape();
+        if (!actual_ps.is_static()) {
+            return node;
+        }
+
+        const auto expected = expected_ps.to_shape();
+        const auto actual = actual_ps.to_shape();
+        if (expected == actual) {
+            return node;
+        }
+
+        auto shape_elems = [](const ov::Shape & shape) -> size_t {
+            size_t n = 1;
+            for (const auto d : shape) {
+                n *= d;
+            }
+            return n;
+        };
+
+        if (shape_elems(expected) != shape_elems(actual)) {
+            return node;
+        }
+
+        auto expected_const = ov::op::v0::Constant::create(ov::element::i64, {expected.size()}, expected);
+        return std::make_shared<ov::op::v1::Reshape>(node, expected_const, false);
+    };
+
+    B = materialize_reshape_only(B, 0);
+    A = materialize_reshape_only(A, 1);
+
     if (A.get_element_type() != B.get_element_type()) {
-        B = std::make_shared<ov::op::v0::Convert>(context.get_input(0), context.get_input_type(1));
+        B = std::make_shared<ov::op::v0::Convert>(B, context.get_input_type(1));
     }
 
-    auto B_shape = context.get_input_shape(0).to_shape();
-    auto A_shape = context.get_input_shape(1).to_shape();
-    int64_t A_batch = A_shape[0];
-    int64_t B_batch = B_shape[0];
-    auto A_batch_larger = A_batch > B_batch;
-    Output<Node> Z = A_batch_larger ? B : A;
-    int64_t factor = A_batch_larger ? A_batch / B_batch : B_batch / A_batch;
-    if (factor > 1) {
-        // TODO code is outdated
-        auto A_batch_node = ov::op::v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{A_batch});
-        auto B_batch_node = ov::op::v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{B_batch});
-        auto factor_node = ov::op::v0::Constant::create(ov::element::i64, {1}, std::vector<int64_t>{factor});
+    // Broadcast batch/head dimension for GQA-style MatMuls where inputs differ by an integer factor (e.g. 32 vs 4).
+    // The OpenVINO MatMul requires broadcastable batch dims; ggml uses implicit repetition.
+    {
+        const auto A_ps = A.get_partial_shape();
+        const auto B_ps = B.get_partial_shape();
+        if (A_ps.rank().is_static() && B_ps.rank().is_static() && A_ps.is_static() && B_ps.is_static() &&
+            A_ps.rank().get_length() == 4 && B_ps.rank().get_length() == 4) {
+            const auto a = A_ps.to_shape();
+            const auto b = B_ps.to_shape();
 
-        auto Z_last_two_dims = get_dimensions(Z.get_node_shared_ptr(), {1, 2});
-
-        auto unsqueeze_axes = ov::op::v0::Constant::create(ov::element::i64, Shape{}, {1});
-        auto Z_unsqueezed = std::make_shared<ov::op::v0::Unsqueeze>(Z, unsqueeze_axes);
-
-        Output<Node> batch_small = A_batch_larger ? B_batch_node : A_batch_node;
-        Output<Node> batch_large = A_batch_larger ? A_batch_node : B_batch_node;
-        auto broadcast_shape =
-            std::make_shared<ov::op::v0::Concat>(ov::OutputVector{batch_small, factor_node, Z_last_two_dims}, 0);
-        auto Z_broadcasted = std::make_shared<ov::op::v3::Broadcast>(Z_unsqueezed, broadcast_shape);
-
-        auto new_Z_shape = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{batch_large, Z_last_two_dims}, 0);
-        Z = std::make_shared<ov::op::v1::Reshape>(Z_broadcasted, new_Z_shape, false);
+            // Only handle the common layout: [1, heads, tokens, dim] (or similar with heads in dim 1).
+            if (a[0] == b[0] && a[1] != b[1]) {
+                const size_t big = std::max(a[1], b[1]);
+                const size_t small = std::min(a[1], b[1]);
+                if (small > 0 && big % small == 0) {
+                    const size_t factor = big / small;
+                    auto repeats = ov::op::v0::Constant::create(ov::element::i64, {4},
+                                                               std::vector<int64_t>{1, (int64_t) factor, 1, 1});
+                    if (a[1] > b[1]) {
+                        B = std::make_shared<ov::op::v0::Tile>(B, repeats);
+                    } else {
+                        A = std::make_shared<ov::op::v0::Tile>(A, repeats);
+                    }
+                }
+            }
+        }
     }
-    if (A_batch_larger) {
-        B = Z;
-    } else {
-        A = Z;
+
+    // Choose whether to transpose the RHS based on the actual (post-materialization) shapes.
+    // This is needed when backend splitting turns MUL_MAT inputs into Parameters and the original "cont(transpose(..))"
+    // producer chain is not available in the OpenVINO graph.
+    {
+        const auto A_ps = A.get_partial_shape();
+        const auto B_ps = B.get_partial_shape();
+        if (A_ps.rank().is_static() && B_ps.rank().is_static() && A_ps.is_static() && B_ps.is_static() &&
+            A_ps.rank().get_length() >= 2 && B_ps.rank().get_length() >= 2) {
+            const auto a = A_ps.to_shape();
+            const auto b = B_ps.to_shape();
+
+            const size_t a_k = a.back();
+            const size_t b_k_no_transpose = b[b.size() - 2];
+            const size_t b_k_transpose = b.back();
+
+            if (a_k == b_k_no_transpose) {
+                transpose_b = false;
+            } else if (a_k == b_k_transpose) {
+                transpose_b = true;
+            }
+        }
     }
 
     res = std::make_shared<ov::op::v0::MatMul>(A, B, false, transpose_b);

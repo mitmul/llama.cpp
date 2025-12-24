@@ -66,7 +66,7 @@ public:
     }
 
     Output<Node> get_input(int idx) const override {
-        return m_tensor_map->at(m_input_names[idx]);
+        return get_input(m_input_names[idx]);
     }
 
     Output<Node> get_input(const std::string& name) const override {

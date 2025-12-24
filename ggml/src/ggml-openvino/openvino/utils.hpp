@@ -70,11 +70,17 @@ std::pair<ov::Output<Node>, ov::Output<Node>> make_sin_cos(int32_t* rope_params,
 
 ov::Output<ov::Node> process_view_input(const NodeContext& context, int input_index, int slice_len = 0);
 
+// Materialize a ggml VIEW tensor input when the producing VIEW op was treated as a no-op by the frontend.
+// This is needed when an op consumes a VIEW directly (without a subsequent CONT that would materialize it).
+ov::Output<ov::Node> materialize_view_input(const NodeContext& context, int input_index);
+
 namespace op {
 template <typename T>
 OutputVector translate_1to1_match_2_inputs(const NodeContext& context) {
     num_inputs_check(context, 2, 2);
-    auto res = std::make_shared<T>(context.get_input(0), context.get_input(1));
+    auto input0 = materialize_view_input(context, 0);
+    auto input1 = materialize_view_input(context, 1);
+    auto res = std::make_shared<T>(input0, input1);
     return rename_outputs_with_suffix({res}, context.get_name());
 }
 }  // namespace op

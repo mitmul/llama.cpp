@@ -20,6 +20,9 @@ OutputVector translate_rms_norm(const NodeContext & context) {
     num_inputs_check(context, 1, 1);
 
     auto input_node = context.get_input(0);
+    if (context.get_op_case() == 2) {
+        input_node = materialize_view_input(context, 0);
+    }
     auto square = std::make_shared<ov::op::v1::Power>(
         input_node, ov::op::v0::Constant::create(ov::element::f32, ov::Shape{1}, {2.0f}));
 

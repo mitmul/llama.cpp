@@ -57,6 +57,52 @@ OutputVector translate_ssm_scan(const NodeContext & context) {
     B = cast_to_out(B);
     C = cast_to_out(C);
 
+    auto shape_elems = [](const ov::Shape & shape) -> size_t {
+        size_t n = 1;
+        for (const auto d : shape) {
+            n *= d;
+        }
+        return n;
+    };
+
+    auto materialize_view_like_input = [&](size_t input_index, ov::Output<ov::Node> node) -> ov::Output<ov::Node> {
+        const auto expected_ps = context.get_input_shape(input_index);
+        if (!expected_ps.rank().is_static() || expected_ps.rank().get_length() != 4) {
+            return node;
+        }
+        const auto expected = expected_ps.to_shape();
+
+        const auto actual_ps = node.get_partial_shape();
+        if (!actual_ps.is_static()) {
+            return node;
+        }
+        const auto actual = actual_ps.to_shape();
+        if (actual == expected) {
+            return node;
+        }
+
+        const size_t expected_n = shape_elems(expected);
+        const size_t actual_n = shape_elems(actual);
+
+        auto expected_const = ov::op::v0::Constant::create(ov::element::i64, {expected.size()}, expected);
+        if (expected_n == actual_n) {
+            return std::make_shared<ov::op::v1::Reshape>(node, expected_const, false);
+        }
+
+        // If the ggml input tensor is a VIEW that slices at the lowest dimension, materialize it via Slice + Reshape.
+        if (expected_n < actual_n) {
+            auto sliced = process_view_input(context, static_cast<int>(input_index));
+            return std::make_shared<ov::op::v1::Reshape>(sliced, expected_const, false);
+        }
+
+        return node;
+    };
+
+    // Several SSM_SCAN inputs are ggml VIEW tensors (slice/reshape) and must be materialized before shape-sensitive ops.
+    x = materialize_view_like_input(1, x);
+    B = materialize_view_like_input(4, B);
+    C = materialize_view_like_input(5, C);
+
     const std::vector<int64_t> ids_axes_vals = {0, 1, 2};
     auto ids_axes = ov::op::v0::Constant::create(ov::element::i64, {ids_axes_vals.size()}, ids_axes_vals);
     auto ids_squeezed = std::make_shared<ov::op::v0::Squeeze>(ids, ids_axes);

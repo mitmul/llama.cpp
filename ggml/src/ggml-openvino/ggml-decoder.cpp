@@ -33,7 +33,12 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
+
+static bool ggml_is_view_op(ggml_op op) {
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+}
 
 GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
                              ModelParams & model_params,
@@ -63,6 +68,39 @@ GgmlOvDecoder::GgmlOvDecoder(ggml_cgraph * cgraph,
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
         auto * cur_node = cgraph->nodes[node_n];
         set_input_output(cur_node);
+    }
+
+    // When computing graph views (e.g. via eval callbacks), the scheduler may call the backend with a partial graph
+    // that ends at an internal node. Ensure the last node in the provided graph is always materialized as an output so
+    // its buffer is populated.
+    if (!m_node_info_list.empty()) {
+        const auto & last = m_node_info_list.back();
+        if (last.node && !ggml_is_view_op(last.node->op) && m_model_outputs.find(last.node_output_name) == m_model_outputs.end()) {
+            m_model_outputs[last.node_output_name] = last.node_output;
+        }
+    }
+
+    // Ensure backend-split graphs materialize boundary tensors as model inputs.
+    // (When a producer op runs on a different backend, its output tensor may not carry GGML_TENSOR_FLAG_INPUT.)
+    std::unordered_set<std::string> output_name_set;
+    output_name_set.reserve(m_node_info_list.size() * 2);
+    for (const auto & node_info : m_node_info_list) {
+        for (const auto & it : node_info.node_inputs) {
+            const auto & src_name = it.first;
+            const auto & src_node = it.second;
+
+            if (output_name_set.find(src_name) == output_name_set.end() &&
+                m_model_weights.find(src_name) == m_model_weights.end() &&
+                m_model_inputs.find(src_name) == m_model_inputs.end()) {
+                m_inputs[src_name] = src_node;
+                auto param_node =
+                    std::make_shared<ov::op::v0::Parameter>(get_ov_type(src_node), get_graph_input_shape(node_info.node, src_node));
+                param_node->set_friendly_name(src_name);
+                param_node->output(0).get_tensor().set_names({src_name});
+                m_model_inputs[src_name] = param_node;
+            }
+        }
+        output_name_set.emplace(node_info.node_output_name);
     }
 
     for (int node_n = 0; node_n < cgraph->n_nodes; node_n++) {
@@ -124,12 +162,22 @@ void GgmlOvDecoder::set_input_output(ggml_tensor * node, bool naive) {
     auto node_output_name = node_name;
     auto * node_output = node;
     if (node->op == GGML_OP_SET_ROWS) {
-        // SET_ROWS updates the tensor in place. For later ov op that uses the
-        // the view_src of SET_ROWS, we need to make sure they get the updated tensor
-        // by putting the view_src name in the tensor_map in
-        // <openvino>/src/frontends/ggml/src/translate_session.cpp
-        node_output_name = std::string(node->view_src->name);
-        node_output = node->view_src;
+        // SET_ROWS updates the tensor in place. For KV caches we want later ops to see the
+        // updated cache, but for recurrent state caches we must keep the original input
+        // to avoid using updated state within the same forward pass.
+        auto is_recurrent_cache = [](const ggml_tensor * tensor) {
+            if (!tensor || tensor->name[0] == '\0') {
+                return false;
+            }
+            const std::string name(tensor->name);
+            return name.find("cache_r_l") != std::string::npos ||
+                   name.find("cache_s_l") != std::string::npos;
+        };
+
+        if (node->view_src && node->view_src->name[0] != '\0' && !is_recurrent_cache(node->view_src)) {
+            node_output_name = std::string(node->view_src->name);
+            node_output = node->view_src;
+        }
     }
 
     current_node_info.node = node;
@@ -255,6 +303,12 @@ int GgmlOvDecoder::compute_op_case(const ggml_tensor * node) const {
         }
         break;
     }
+    case GGML_OP_RMS_NORM: {
+        if (node->src[0]->op == GGML_OP_VIEW) {
+            op_case = 2;
+        }
+        break;
+    }
     case GGML_OP_VIEW: {
         if (node->src[0]->op == GGML_OP_VIEW) {
             auto * src = node->src[0];
@@ -360,6 +414,18 @@ void GgmlOvDecoder::validate_cgraph() const {
 ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, const ggml_tensor * input) const {
     auto name = std::string(input->name);
     ov::PartialShape input_shape;
+    auto is_recurrent_cache = [](const ggml_tensor * tensor) {
+        if (!tensor) {
+            return false;
+        }
+        const ggml_tensor * base = tensor->name[0] != '\0' ? tensor : tensor->view_src;
+        if (!base || base->name[0] == '\0') {
+            return false;
+        }
+        const std::string base_name(base->name);
+        return base_name.find("cache_r_l") != std::string::npos ||
+               base_name.find("cache_s_l") != std::string::npos;
+    };
 
     if (name == "inp_tokens" || name == "inp_pos") {
         int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
@@ -378,13 +444,28 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op, co
     } else if (name.find("cache_") == 0) {
         input_shape = ov::PartialShape{get_shape(input)};
         if (!m_is_static) {
-            // do not fix ctx size to make llama-bench work
-            input_shape[2] = -1;
+            const char * dev_env = getenv("GGML_OPENVINO_DEVICE");
+            const std::string device = dev_env ? std::string(dev_env) : "CPU";
+            const bool dynamic_cache = [] {
+                const char * env = getenv("GGML_OPENVINO_DYNAMIC_CACHE");
+                return env && std::string(env) != "0";
+            }();
+
+            // Default: keep KV cache shapes static on CPU to avoid OpenVINO CPU plugin crashes seen with some dynamic
+            // ScatterUpdate-heavy graphs (e.g. plamo2 + large ctx). Users can opt back into dynamic cache shapes with
+            // GGML_OPENVINO_DYNAMIC_CACHE=1 (useful for llama-bench).
+            if (device != "CPU" || dynamic_cache) {
+                input_shape[2] = -1;
+            }
         }
 
     } else if (op && op->op == GGML_OP_SET_ROWS && op->src[1] == input) {
-        int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
-        input_shape = ov::PartialShape{1, 1, 1, len};
+        if (is_recurrent_cache(op->src[2])) {
+            input_shape = ov::PartialShape{get_shape(input)};
+        } else {
+            int len = m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1;
+            input_shape = ov::PartialShape{1, 1, 1, len};
+        }
 
     } else {
         input_shape = ov::PartialShape{get_shape(input)};
@@ -475,7 +556,7 @@ std::map<std::string, std::shared_ptr<ov::Node>> GgmlOvDecoder::create_weight_no
     static std::mutex weights_mutex;
     auto * nodes = cgraph->nodes;
     auto n_nodes = cgraph->n_nodes;
-    std::for_each(std::execution::par, nodes, nodes + n_nodes, [&](ggml_tensor * node) {
+    std::for_each(nodes, nodes + n_nodes, [&](ggml_tensor * node) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             auto * src = node->src[i];
             if (src == nullptr) {

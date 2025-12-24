@@ -10,10 +10,11 @@ struct graph_key {
     size_t n_nodes;
     std::string first_node_name;
     std::string last_node_name;
+    size_t inputs_hash = 0;
 
     bool operator==(const graph_key & other) const {
         return n_nodes == other.n_nodes && first_node_name == other.first_node_name &&
-               last_node_name == other.last_node_name;
+               last_node_name == other.last_node_name && inputs_hash == other.inputs_hash;
     }
 };
 
@@ -22,6 +23,7 @@ struct graph_key_hash {
         size_t h = std::hash<size_t>{}(key.n_nodes);
         h ^= std::hash<std::string>{}(key.first_node_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<std::string>{}(key.last_node_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>{}(key.inputs_hash) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -29,7 +31,7 @@ struct graph_key_hash {
 enum ggml_status ov_graph_compute(struct ggml_cgraph * cgraph);
 
 enum ggml_status ov_graph_compute_dynamic(struct ggml_cgraph * cgraph, const std::string & device);
-enum ggml_status ov_graph_compute_static(struct ggml_cgraph * cgraph);
+enum ggml_status ov_graph_compute_static(struct ggml_cgraph * cgraph, const std::string & device);
 
 size_t checksum(const void * data, size_t size);
 

@@ -26,7 +26,7 @@ OutputVector translate_reshape(const NodeContext & context) {
 
     int op_case = context.get_op_case();
     FRONT_END_CHECK_IMPLEMENTED(
-        op_case == 1 || op_case == 2 || op_case == 3 || op_case == 4 || op_case == 5 || op_case == 6,
+        op_case == 0 || op_case == 1 || op_case == 2 || op_case == 3 || op_case == 4 || op_case == 5 || op_case == 6,
         "Unsupported RESHAPE case");
 
     auto output_shape = context.get_output_shape().to_shape();
@@ -42,9 +42,9 @@ OutputVector translate_reshape(const NodeContext & context) {
             std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, (int64_t) output_shape[3]});
 
     } else if (op_case == 3) {
-        throw std::runtime_error("might be outdated RESHAPE case");
-        new_shape_node = ov::op::v0::Constant::create(
-            ov::element::i64, {4}, std::vector<int64_t>{(int64_t) output_shape[0], (int64_t) output_shape[1], -1, 1});
+        // Fallback: use the fully specified ggml output shape.
+        // (This case was previously marked "outdated", but a regular reshape is correct for many graphs.)
+        new_shape_node = ov::op::v0::Constant::create(ov::element::i64, {4}, output_shape);
 
     } else if (op_case == 4) {
         return {context.get_input(0).get_node_shared_ptr()->input_value(0)};
@@ -62,6 +62,10 @@ OutputVector translate_reshape(const NodeContext & context) {
 
     } else if (op_case == 6) {
         new_shape_node = ov::op::v0::Constant::create(ov::element::i64, {4}, context.get_output_shape().to_shape());
+
+    } else {
+        // Generic fallback for otherwise-unclassified reshape patterns.
+        new_shape_node = ov::op::v0::Constant::create(ov::element::i64, {4}, output_shape);
     }
     auto res = std::make_shared<ov::op::v1::Reshape>(context.get_input(0), new_shape_node, false);
     return rename_outputs_with_suffix({res}, context.get_name());

@@ -54,8 +54,10 @@ OutputVector translate_permute(const NodeContext & context) {
         auto output_shape = context.get_output_shape().to_shape();
         int64_t head_size = output_shape[3];
         int64_t n_heads = output_shape[1];
-        int64_t ctx_per_seq = cache_shape[2].is_static() ? cache_shape[2].get_length() : -1;
-        int64_t n_seq = cache_shape[1].get_length();
+        // Shapes are stored in reverse order vs ggml: [ne3, ne2, ne1, ne0].
+        // For KV cache views this corresponds to [n_seq, ctx_per_seq, n_heads, head_size].
+        int64_t n_seq = cache_shape[0].is_static() ? cache_shape[0].get_length() : -1;
+        int64_t ctx_per_seq = cache_shape[1].is_static() ? cache_shape[1].get_length() : -1;
 
         Output<Node> attention_size;
         if (!context.has_input("attention_size")) {

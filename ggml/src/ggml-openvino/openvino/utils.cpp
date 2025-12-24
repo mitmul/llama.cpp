@@ -2,6 +2,7 @@
 
 #include "ggml-impl.h"
 
+#include <cstdio>
 #include <cstddef>
 #include <ctime>
 #include <memory>
@@ -13,6 +14,7 @@
 #include <openvino/op/gather.hpp>
 #include <openvino/op/maximum.hpp>
 #include <openvino/op/multiply.hpp>
+#include <openvino/op/reshape.hpp>
 #include <openvino/op/shape_of.hpp>
 #include <openvino/op/sin.hpp>
 #include <openvino/op/subtract.hpp>
@@ -179,10 +181,98 @@ std::pair<ov::Output<Node>, ov::Output<Node>> make_sin_cos(int32_t * rope_params
     return std::make_pair(sin_theta, cos_theta);
 }
 
+ov::Output<ov::Node> materialize_view_input(const NodeContext & context, int input_index) {
+    auto input = context.get_input(input_index);
+
+    const bool trace_enabled = [] {
+        const char * env = std::getenv("GGML_OPENVINO_TRACE_MATERIALIZE");
+        return env && std::string(env) != "0";
+    }();
+
+    const auto expected_ps = context.get_input_shape(input_index);
+    const auto actual_ps = input.get_partial_shape();
+
+    if (!expected_ps.rank().is_static() || expected_ps.rank().get_length() != 4) {
+        return input;
+    }
+    if (!expected_ps.is_static() || !actual_ps.is_static()) {
+        return input;
+    }
+
+    const auto expected = expected_ps.to_shape();
+    const auto actual = actual_ps.to_shape();
+    if (expected == actual) {
+        return input;
+    }
+
+    auto shape_elems = [](const ov::Shape & shape) -> size_t {
+        size_t n = 1;
+        for (const auto d : shape) {
+            n *= d;
+        }
+        return n;
+    };
+
+    const size_t expected_n = shape_elems(expected);
+    const size_t actual_n = shape_elems(actual);
+
+    auto expected_const = ov::op::v0::Constant::create(ov::element::i64, {expected.size()}, expected);
+
+    // Reshape-only VIEW (same number of elements, different logical shape).
+    if (expected_n == actual_n) {
+        return std::make_shared<ov::op::v1::Reshape>(input, expected_const, false);
+    }
+
+    // Slicing VIEW (fewer elements than the producer). Only support slicing at the lowest dimension (axis 3).
+    // For views that also reshape the result, slice_len must cover the full output element count per row of the source.
+    if (expected_n < actual_n) {
+        const size_t prefix_n = actual[0] * actual[1] * actual[2];
+        if (prefix_n == 0 || expected_n % prefix_n != 0) {
+            return input;
+        }
+
+        const size_t slice_len_u = expected_n / prefix_n;
+        if (slice_len_u > actual[3]) {
+            return input;
+        }
+
+        if (trace_enabled) {
+            const auto & input_names = context.get_input_names();
+            const std::string input_name = input_index < (int) input_names.size() ? input_names[input_index] : "";
+            std::fprintf(stderr,
+                         "GGML OpenVINO TRACE_MATERIALIZE: consumer='%s' input[%d]='%s' actual=[%zu,%zu,%zu,%zu] expected=[%zu,%zu,%zu,%zu] expected_n=%zu actual_n=%zu prefix_n=%zu slice_len=%zu\n",
+                         context.get_name().c_str(),
+                         input_index,
+                         input_name.c_str(),
+                         actual[0], actual[1], actual[2], actual[3],
+                         expected[0], expected[1], expected[2], expected[3],
+                         expected_n,
+                         actual_n,
+                         prefix_n,
+                         slice_len_u);
+            std::fflush(stderr);
+        }
+
+        auto sliced = process_view_input(context, input_index, static_cast<int>(slice_len_u));
+        return std::make_shared<ov::op::v1::Reshape>(sliced, expected_const, false);
+    }
+
+    return input;
+}
+
 ov::Output<ov::Node> process_view_input(const NodeContext & context, int input_index, int slice_len) {
     // Only works for VIEW operations that slice at the lowest dimension
     // If the VIEW also reshape the result, `slice_len` should be provided
     auto input = context.get_input(input_index);
+
+    // When the VIEW itself is already materialized upstream (e.g. by another backend split),
+    // the input tensor already matches the VIEW output shape and no additional slicing is needed.
+    const auto expected_ps = context.get_input_shape(input_index);
+    const auto actual_ps = input.get_partial_shape();
+    if (expected_ps.is_static() && actual_ps.is_static() && expected_ps.to_shape() == actual_ps.to_shape()) {
+        return input;
+    }
+
     auto * op_params = (size_t *) context.get_input_op_params(input_index);
     auto src1_stride = context.get_input_stride(input_index);
 

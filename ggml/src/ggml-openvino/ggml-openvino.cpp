@@ -173,6 +173,17 @@ static ggml_backend_buffer_type_t ggml_backend_openvino_device_get_buffer_type(g
 }
 
 static bool is_op_unsupported_case(const ggml_tensor * op) {
+    // OpenVINO runtime/CPU plugin can be unstable with zero-sized tensors (e.g. empty views when ssm_n_group == 0).
+    // Keep these ops on the ggml CPU backend.
+    if (ggml_nelements(op) == 0) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_WARN("OpenVINO backend: running zero-sized tensor ops on CPU for stability\n");
+            warned = true;
+        }
+        return true;
+    }
+
     switch (op->op) {
     case GGML_OP_SOFT_MAX: {
         if (op->src[2] != nullptr) {
@@ -191,6 +202,23 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
         break;
     }
     case GGML_OP_FLASH_ATTN_EXT: {
+        const char * ov_device = getenv("GGML_OPENVINO_DEVICE");
+        const std::string device = ov_device ? std::string(ov_device) : "CPU";
+        if (device == "CPU") {
+            const bool allow_flash_attn = [] {
+                const char * env = getenv("GGML_OPENVINO_ALLOW_FLASH_ATTN_EXT");
+                return env && std::string(env) != "0";
+            }();
+            if (!allow_flash_attn) {
+                static bool warned = false;
+                if (!warned) {
+                    GGML_LOG_WARN("OpenVINO CPU backend: running FLASH_ATTN_EXT on CPU for stability (set GGML_OPENVINO_ALLOW_FLASH_ATTN_EXT=1 to override)\n");
+                    warned = true;
+                }
+                return true;
+            }
+        }
+
         if (op->src[4] != nullptr) {
             GGML_LOG_WARN("OpenVINO backend does not support FLASH_ATTN_EXT with sinks\n");
             return true;
@@ -223,6 +251,58 @@ static bool is_op_unsupported_case(const ggml_tensor * op) {
     case GGML_OP_CPY: {
         if (op->src[1] != op) {
             GGML_LOG_WARN("OpenVINO backend only supports CPY that is a cast\n");
+            return true;
+        }
+        break;
+    }
+    case GGML_OP_SET_ROWS: {
+        const char * ov_device = getenv("GGML_OPENVINO_DEVICE");
+        const std::string device = ov_device ? std::string(ov_device) : "CPU";
+        if (device == "CPU") {
+            const bool allow_set_rows = [] {
+                const char * env = getenv("GGML_OPENVINO_ALLOW_SET_ROWS");
+                return env && std::string(env) != "0";
+            }();
+            if (!allow_set_rows) {
+                static bool warned = false;
+                if (!warned) {
+                    GGML_LOG_WARN("OpenVINO CPU backend: running SET_ROWS on CPU for stability (set GGML_OPENVINO_ALLOW_SET_ROWS=1 to override)\n");
+                    warned = true;
+                }
+                return true;
+            }
+        }
+
+        const ggml_tensor * dst = op->src[2];
+        const ggml_tensor * dst_base = dst;
+        if (dst_base && dst_base->name[0] == '\0') {
+            dst_base = dst_base->view_src;
+        }
+        if (dst_base && dst_base->name[0] != '\0') {
+            const std::string dst_name(dst_base->name);
+            if (dst_name.find("cache_r_l") != std::string::npos ||
+                dst_name.find("cache_s_l") != std::string::npos) {
+                // Run recurrent-state cache updates on CPU for correctness.
+                return true;
+            }
+        }
+        break;
+    }
+    case GGML_OP_SSM_SCAN: {
+        const char * ov_device = getenv("GGML_OPENVINO_DEVICE");
+        const std::string device = ov_device ? std::string(ov_device) : "CPU";
+        if (device == "CPU") {
+            // The OpenVINO CPU plugin may crash when compiling TensorIterator-heavy graphs produced by SSM_SCAN.
+            // Run SSM_SCAN on the ggml CPU backend for stability.
+            return true;
+        }
+        break;
+    }
+    case GGML_OP_SSM_CONV: {
+        const char * ov_device = getenv("GGML_OPENVINO_DEVICE");
+        const std::string device = ov_device ? std::string(ov_device) : "CPU";
+        if (device == "CPU") {
+            // The OpenVINO CPU plugin has shown instability when compiling SSM-heavy graphs; keep SSM_CONV on CPU.
             return true;
         }
         break;
@@ -289,8 +369,7 @@ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, con
                                                  GGML_OP_PERMUTE, GGML_OP_TRANSPOSE,
                                                  GGML_OP_GET_ROWS, GGML_OP_ROPE, GGML_OP_RMS_NORM, GGML_OP_SCALE,
                                                  GGML_OP_SSM_CONV, GGML_OP_SSM_SCAN,
-                                                 // softmax is not updated due to replaced by flash_attn_ext
-                                                 // GGML_OP_SOFT_MAX,
+                                                 GGML_OP_SOFT_MAX,
                                                  GGML_OP_SET_ROWS, GGML_OP_FLASH_ATTN_EXT, GGML_OP_CPY};
     static const std::set<ggml_unary_op> supported_unary_ops{
         GGML_UNARY_OP_SILU,
