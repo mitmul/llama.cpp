@@ -818,6 +818,7 @@ std::string GgmlOvDecoder::compute_op_type(const ggml_tensor * node) {
         {GGML_OP_CPY,            "GGML_OP_CPY"           },
         {GGML_OP_FLASH_ATTN_EXT, "GGML_OP_FLASH_ATTN_EXT"},
         {GGML_OP_SSM_CONV,       "GGML_OP_SSM_CONV"      },
+        {GGML_OP_SSM_SCAN,       "GGML_OP_SSM_SCAN"      },
     };
     static const std::map<ggml_unary_op, std::string> unary_ops = {
         {GGML_UNARY_OP_ABS,         "GGML_UNARY_OP_ABS"        },
