@@ -157,3 +157,4 @@ package.json
 playwright.config.ts
 prompt_translate.txt
 e2e/example.spec.ts
+plamo-2-translate-eval-callback-log.txt

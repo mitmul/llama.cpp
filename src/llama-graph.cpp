@@ -236,17 +236,39 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    GGML_ASSERT(ubatch != nullptr);
 
-    const int64_t n_rs = mctx->get_n_rs();
+    const int64_t n_rs   = mctx->get_n_rs();
+    const int64_t n_seqs = ubatch->n_seqs;
+    const int64_t head   = mctx->get_head();
+
+    GGML_ASSERT(n_seqs <= n_rs);
 
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->s_copy(i);
+        for (int64_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx->s_copy((int) i);
+        }
+    }
+
+    if (s_copy_main_dst && s_copy_main_dst->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_main_dst->buffer));
+        int32_t * data = (int32_t *) s_copy_main_dst->data;
+
+        for (int64_t i = 0; i < n_seqs; ++i) {
+            data[i] = (int32_t) (head + i);
+        }
+    }
+
+    if (s_copy_extra_dst && n_rs > n_seqs && s_copy_extra_dst->buffer) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_extra_dst->buffer));
+        int32_t * data = (int32_t *) s_copy_extra_dst->data;
+
+        for (int64_t i = 0; i < n_rs - n_seqs; ++i) {
+            data[i] = (int32_t) (head + n_seqs + i);
         }
     }
 }
@@ -1802,10 +1824,10 @@ ggml_tensor * llm_graph_context::build_rs(
         ggml_tensor * s,
         ggml_tensor * state_copy_main,
         ggml_tensor * state_copy_extra,
+        ggml_tensor * state_copy_extra_dst,
             int32_t   state_size,
             int32_t   n_seqs,
            uint32_t   n_rs,
-           uint32_t   rs_head,
            uint32_t   rs_size,
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
@@ -1818,17 +1840,16 @@ ggml_tensor * llm_graph_context::build_rs(
     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
 
     // copy states
-    // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+    // NOTE: assuming the destination indices are contained within the active rs range
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
-    ggml_build_forward_expand(gf,
-        ggml_cpy(ctx0,
-            states_extra,
-            ggml_view_1d(ctx0, s, state_size*(n_rs - n_seqs), (rs_head + n_seqs)*state_size*ggml_element_size(s))));
+    if (n_rs > (uint32_t) n_seqs) {
+        ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, states, states_extra, state_copy_extra_dst));
+    }
 
     return output_states;
 }
@@ -1849,6 +1870,12 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    inp->s_copy_main_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+    ggml_set_input(inp->s_copy_main_dst);
+
+    inp->s_copy_extra_dst = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs - n_seqs);
+    ggml_set_input(inp->s_copy_extra_dst);
+
     return inp;
 }
 
@@ -1868,8 +1895,8 @@ ggml_tensor * llm_graph_context::build_rs(
         const llm_graph_get_rows_fn & get_state_rows) const {
     const auto * kv_state = inp->mctx;
 
-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
-                    kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, inp->s_copy_extra_dst, state_size, n_seqs,
+                    kv_state->get_n_rs(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
 }
 

@@ -230,6 +230,8 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main_dst;   // I32 [n_seqs]
+    ggml_tensor * s_copy_extra_dst;  // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 };
@@ -777,10 +779,10 @@ struct llm_graph_context {
             ggml_tensor * s,
             ggml_tensor * state_copy_main,
             ggml_tensor * state_copy_extra,
+            ggml_tensor * state_copy_extra_dst,
                 int32_t   state_size,
                 int32_t   n_seqs,
                uint32_t   n_rs,
-               uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
