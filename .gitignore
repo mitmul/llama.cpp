@@ -152,3 +152,8 @@ poetry.toml
 # IDE
 *.code-workspace
 .windsurf/
+package-lock.json
+package.json
+playwright.config.ts
+prompt_translate.txt
+e2e/example.spec.ts
