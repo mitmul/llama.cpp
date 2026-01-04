@@ -2,7 +2,7 @@ param(
     [string]$BuildDir = "build-openvino-cpu-relwithdebinfo",
     [ValidateSet("Debug", "Release", "RelWithDebInfo", "MinSizeRel")]
     [string]$Config = "RelWithDebInfo",
-    [string]$SetupVars = "C:\\Users\\NECPC-USER\\Downloads\\openvino_genai_windows_2025.4.0.0_x86_64\\openvino_genai_windows_2025.4.0.0_x86_64\\setupvars.ps1"
+    [string]$SetupVars = "C:\\Users\\NEC\\Downloads\\openvino_genai_windows_2025.4.0.0_x86_64\\openvino_genai_windows_2025.4.0.0_x86_64\\setupvars.ps1"
 )
 
 Set-StrictMode -Version Latest
@@ -65,13 +65,15 @@ try {
     }
     Write-Host "`nOpenVINO CPU build complete: $BuildDir ($Config)" -ForegroundColor Green
 
+    $OutputFile = "tmp/plamo-2-translate-eval-callback_openvino_cpu.txt"
+
     # .\build-openvino-cpu-relwithdebinfo\bin\RelWithDebInfo\llama-eval-callback.exe
     & "$BuildDir\\bin\\$Config\\llama-eval-callback.exe" `
-    -m .\plamo-2-translate_Q4_0.gguf `
+    -m .\tmp\plamo-2-translate_Q4_0.gguf `
     -c 2048 `
     -n 8 `
     -p "<|plamo:bos|><|plamo:op|>dataset\ntranslation\n<|plamo:op|>input\nThis is a white pen.\n<|plamo:op|>output\n" `
-    2>&1 > tmp/plamo-2-translate-eval-callback_openvino_cpu.txt
+    2>&1 | Out-File -FilePath $OutputFile -Encoding UTF8
 } finally {
     $ErrorActionPreference = $nativeEap
 }

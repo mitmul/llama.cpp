@@ -2,7 +2,7 @@ param(
     [string]$BuildDir = "build-openvino-cpu-relwithdebinfo",
     [ValidateSet("Debug", "Release", "RelWithDebInfo", "MinSizeRel")]
     [string]$Config = "RelWithDebInfo",
-    [string]$SetupVars = "C:\\Users\\NECPC-USER\\Downloads\\openvino_genai_windows_2025.4.0.0_x86_64\\openvino_genai_windows_2025.4.0.0_x86_64\\setupvars.ps1"
+    [string]$SetupVars = "C:\\Users\\NEC\\Downloads\\openvino_genai_windows_2025.4.0.0_x86_64\\openvino_genai_windows_2025.4.0.0_x86_64\\setupvars.ps1"
 )
 
 Set-StrictMode -Version Latest
@@ -69,7 +69,7 @@ try {
 
     # .\build-openvino-cpu-relwithdebinfo\bin\RelWithDebInfo\llama-eval-callback.exe
     & "$BuildDir\\bin\\$Config\\llama-cli.exe" `
-    -m .\plamo-2-translate_Q4_0.gguf `
+    -m .\tmp\plamo-2-translate_Q4_0.gguf `
     -c 2048 `
     -n 8 `
     -lv 3 `
